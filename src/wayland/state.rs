@@ -1,17 +1,19 @@
-//! The Wayland client that owns the barrier surfaces.
+//! The Wayland client that owns the barrier surfaces and the capture grab.
 
 use super::{place, Edge, PlacedBarrier, WaylandCmd, WaylandEvent};
+use crate::eis_server::{EisCommand, EisHandle, SharedKeymap};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_registry,
     output::{OutputHandler, OutputState},
-    reexports::calloop::EventLoop,
-    reexports::calloop_wayland_source::WaylandSource,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::{KeyEvent, Keymap, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        relative_pointer::{RelativeMotionEvent, RelativePointerHandler, RelativePointerState},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -27,9 +29,18 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_buffer, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{
+        wl_buffer, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+    },
     Connection, QueueHandle,
 };
+use wayland_protocols::wp::{
+    pointer_constraints::zv1::client::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1},
+    relative_pointer::zv1::client::zwp_relative_pointer_v1,
+};
+
+/// Wayland keycodes are evdev codes offset by 8; EIS wants the evdev value.
+const EVDEV_OFFSET: u32 = 8;
 
 struct BarrierSurface {
     id: u32,
@@ -39,6 +50,18 @@ struct BarrierSurface {
     drawn: bool,
 }
 
+/// State held while input is being redirected to the client.
+struct Capture {
+    barrier_id: u32,
+    lock: zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    layer: LayerSurface,
+    origin: (i32, i32),
+    /// Absent until the portal hands over the session's EIS connection.
+    eis: Option<EisHandle>,
+    /// Events observed before the EIS handle arrived.
+    pending: Vec<EisCommand>,
+}
+
 struct AppState {
     registry_state: RegistryState,
     output_state: OutputState,
@@ -46,9 +69,17 @@ struct AppState {
     shm: Shm,
     compositor: CompositorState,
     layer_shell: LayerShell,
+    relative_pointer_state: RelativePointerState,
+    pointer_constraints: PointerConstraintsState,
     pool: SlotPool,
     pointer: Option<wl_pointer::WlPointer>,
+    relative_pointer: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    keymap: SharedKeymap,
+    modifiers: Modifiers,
+    last_enter_serial: u32,
     surfaces: Vec<BarrierSurface>,
+    capture: Option<Capture>,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
     exit: bool,
 }
@@ -87,6 +118,10 @@ impl AppState {
     }
 
     fn arm(&mut self, barriers: &[crate::portal::Barrier], qh: &QueueHandle<Self>) {
+        if self.capture.is_some() {
+            debug!("ignoring Arm while a capture is in progress");
+            return;
+        }
         self.disarm();
 
         let layout = self.layout();
@@ -162,13 +197,136 @@ impl AppState {
 
         let s = &mut self.surfaces[index];
         let surface = s.layer.wl_surface();
-        // An empty input region would make the surface ignore the pointer, and
-        // the default region already covers the whole surface, so leave it.
         buffer.attach_to(surface).ok();
         surface.damage_buffer(0, 0, w, h);
         surface.commit();
         s.buffer = Some(buffer.wl_buffer().clone());
         s.drawn = true;
+    }
+
+    /// Take over the pointer and keyboard the moment a barrier is crossed.
+    ///
+    /// This runs before the portal is told anything, so the round trip through
+    /// D-Bus cannot leak pointer motion onto the local screen.
+    fn begin_capture(&mut self, index: usize, position: (f64, f64), qh: &QueueHandle<Self>) {
+        if self.capture.is_some() {
+            return;
+        }
+        let Some(pointer) = self.pointer.clone() else {
+            warn!("barrier crossed but there is no pointer to lock");
+            return;
+        };
+
+        let s = &self.surfaces[index];
+        let (barrier_id, origin, layer) = (s.id, s.origin, s.layer.clone());
+        let surface = layer.wl_surface().clone();
+
+        let lock = match self.pointer_constraints.lock_pointer(
+            &surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            qh,
+        ) {
+            Ok(lock) => lock,
+            Err(err) => {
+                warn!("failed to lock the pointer, not capturing: {err}");
+                return;
+            }
+        };
+
+        // Exclusive keyboard focus is what lets keystrokes reach the remote
+        // screen instead of whatever window happens to be focused locally.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+
+        // A locked pointer still draws a cursor; hide it so the screen looks
+        // like the pointer really left.
+        pointer.set_cursor(self.last_enter_serial, None, 0, 0);
+
+        info!(barrier = barrier_id, ?position, "barrier crossed, capturing input");
+        self.capture = Some(Capture {
+            barrier_id,
+            lock,
+            layer,
+            origin,
+            eis: None,
+            pending: Vec::new(),
+        });
+
+        let _ = self.event_tx.send(WaylandEvent::Activated {
+            barrier_id,
+            position,
+        });
+    }
+
+    fn attach_eis(&mut self, eis: EisHandle) {
+        let Some(capture) = &mut self.capture else {
+            debug!("EIS handle arrived with no capture in progress");
+            return;
+        };
+        // Flush whatever happened between the crossing and this handover.
+        if !capture.pending.is_empty() {
+            debug!("flushing {} buffered event(s)", capture.pending.len());
+            for cmd in capture.pending.drain(..) {
+                eis.send(cmd);
+            }
+            eis.send(EisCommand::Frame);
+        }
+        capture.eis = Some(eis);
+    }
+
+    fn end_capture(&mut self, cursor_hint: Option<(f64, f64)>) {
+        let Some(capture) = self.capture.take() else {
+            return;
+        };
+
+        if let Some((x, y)) = cursor_hint {
+            // The hint is surface-local, and the surface is one pixel wide, so
+            // this can only nudge the cursor along the barrier rather than back
+            // into the screen. Better than nothing; a wider release surface
+            // would be needed to do this properly.
+            let local = (
+                x - f64::from(capture.origin.0),
+                y - f64::from(capture.origin.1),
+            );
+            capture.lock.set_cursor_position_hint(local.0, local.1);
+            capture.layer.wl_surface().commit();
+        }
+
+        capture.lock.destroy();
+        capture.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        capture.layer.commit();
+
+        if let Some(pointer) = &self.pointer {
+            // Hand the cursor image back to the compositor default.
+            pointer.set_cursor(self.last_enter_serial, None, 0, 0);
+        }
+        info!(barrier = capture.barrier_id, "capture ended, pointer released");
+    }
+
+    /// Route one event to the client, buffering if EIS is not attached yet.
+    fn forward(&mut self, cmd: EisCommand) {
+        let Some(capture) = &mut self.capture else {
+            return;
+        };
+        match &capture.eis {
+            Some(eis) => eis.send(cmd),
+            None => capture.pending.push(cmd),
+        }
+    }
+
+    fn forward_frame(&mut self) {
+        self.forward(EisCommand::Frame);
+    }
+
+    /// The local escape hatch out of an exclusive keyboard grab.
+    ///
+    /// If the client stops calling Release the pointer stays locked and the
+    /// keyboard stays grabbed, which would otherwise need a kill from another
+    /// machine to undo.
+    fn is_panic_key(&self, event: &KeyEvent) -> bool {
+        self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::Escape
     }
 }
 
@@ -226,8 +384,9 @@ impl OutputHandler for AppState {
     }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
-        // Surfaces on a vanished output are already dead; drop them so a later
-        // Arm rebuilds against the new layout.
+        // A capture anchored to a vanished output cannot be recovered, and
+        // leaving the grab in place would strand the pointer.
+        self.end_capture(None);
         self.disarm();
         let _ = self.event_tx.send(WaylandEvent::OutputsChanged);
     }
@@ -235,6 +394,9 @@ impl OutputHandler for AppState {
 
 impl LayerShellHandler for AppState {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.capture.as_ref().is_some_and(|c| &c.layer == layer) {
+            self.end_capture(None);
+        }
         self.surfaces.retain(|s| &s.layer != layer);
     }
 
@@ -270,11 +432,29 @@ impl SeatHandler for AppState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer && self.pointer.is_none() {
-            match self.seat_state.get_pointer(qh, &seat) {
-                Ok(p) => self.pointer = Some(p),
-                Err(err) => warn!("failed to acquire the pointer: {err}"),
+        match capability {
+            Capability::Pointer if self.pointer.is_none() => {
+                match self.seat_state.get_pointer(qh, &seat) {
+                    Ok(p) => {
+                        self.relative_pointer =
+                            self.relative_pointer_state.get_relative_pointer(&p, qh).ok();
+                        if self.relative_pointer.is_none() {
+                            warn!("niri did not offer zwp_relative_pointer_v1; motion cannot be captured");
+                        }
+                        self.pointer = Some(p);
+                    }
+                    Err(err) => warn!("failed to acquire the pointer: {err}"),
+                }
             }
+            Capability::Keyboard if self.keyboard.is_none() => {
+                // Bound up front rather than on capture, because the keymap
+                // arrives on this object and the EIS device needs it earlier.
+                match self.seat_state.get_keyboard(qh, &seat, None) {
+                    Ok(k) => self.keyboard = Some(k),
+                    Err(err) => warn!("failed to acquire the keyboard: {err}"),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -285,10 +465,22 @@ impl SeatHandler for AppState {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Pointer {
-            if let Some(p) = self.pointer.take() {
-                p.release();
+        match capability {
+            Capability::Pointer => {
+                self.end_capture(None);
+                if let Some(p) = self.pointer.take() {
+                    p.release();
+                }
+                if let Some(r) = self.relative_pointer.take() {
+                    r.destroy();
+                }
             }
+            Capability::Keyboard => {
+                if let Some(k) = self.keyboard.take() {
+                    k.release();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -299,33 +491,257 @@ impl PointerHandler for AppState {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
-            // Entering a barrier surface is the crossing. Motion within it is
-            // not interesting yet — phase 3 locks the pointer on activation.
-            if !matches!(event.kind, PointerEventKind::Enter { .. }) {
-                continue;
+            match &event.kind {
+                PointerEventKind::Enter { serial } => {
+                    self.last_enter_serial = *serial;
+                    let Some(index) = self
+                        .surfaces
+                        .iter()
+                        .position(|s| s.layer.wl_surface() == &event.surface)
+                    else {
+                        continue;
+                    };
+                    let s = &self.surfaces[index];
+                    let position = (
+                        f64::from(s.origin.0) + event.position.0,
+                        f64::from(s.origin.1) + event.position.1,
+                    );
+                    self.begin_capture(index, position, qh);
+                }
+                PointerEventKind::Press { button, .. } => {
+                    if self.capture.is_some() {
+                        self.forward(EisCommand::Button {
+                            button: *button,
+                            press: true,
+                        });
+                        self.forward_frame();
+                    }
+                }
+                PointerEventKind::Release { button, .. } => {
+                    if self.capture.is_some() {
+                        self.forward(EisCommand::Button {
+                            button: *button,
+                            press: false,
+                        });
+                        self.forward_frame();
+                    }
+                }
+                PointerEventKind::Axis {
+                    horizontal,
+                    vertical,
+                    ..
+                } => {
+                    if self.capture.is_none() {
+                        continue;
+                    }
+                    if horizontal.stop || vertical.stop {
+                        self.forward(EisCommand::ScrollStop);
+                    }
+                    // value120 is the high-resolution wheel API; discrete is the
+                    // legacy fallback for compositors that do not send it.
+                    let (hd, vd) = if horizontal.value120 != 0 || vertical.value120 != 0 {
+                        (horizontal.value120, vertical.value120)
+                    } else {
+                        (horizontal.discrete * 120, vertical.discrete * 120)
+                    };
+                    if hd != 0 || vd != 0 {
+                        self.forward(EisCommand::ScrollDiscrete { dx: hd, dy: vd });
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    if horizontal.absolute != 0.0 || vertical.absolute != 0.0 {
+                        self.forward(EisCommand::Scroll {
+                            dx: horizontal.absolute as f32,
+                            dy: vertical.absolute as f32,
+                        });
+                    }
+                    self.forward_frame();
+                }
+                PointerEventKind::Motion { .. } | PointerEventKind::Leave { .. } => {}
             }
-            let Some(s) = self
-                .surfaces
-                .iter()
-                .find(|s| s.layer.wl_surface() == &event.surface)
-            else {
-                continue;
-            };
+        }
+    }
+}
 
-            let position = (
-                f64::from(s.origin.0) + event.position.0,
-                f64::from(s.origin.1) + event.position.1,
-            );
-            info!(barrier = s.id, ?position, "barrier crossed");
-            let _ = self.event_tx.send(WaylandEvent::Activated {
-                barrier_id: s.id,
-                position,
-            });
+impl RelativePointerHandler for AppState {
+    fn relative_pointer_motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        _: &wl_pointer::WlPointer,
+        event: RelativeMotionEvent,
+    ) {
+        if self.capture.is_none() {
+            return;
+        }
+        // Accelerated deltas, so pointer feel on the remote screen matches the
+        // local pointer settings.
+        #[allow(clippy::cast_possible_truncation)]
+        self.forward(EisCommand::Motion {
+            dx: event.delta.0 as f32,
+            dy: event.delta.1 as f32,
+        });
+        self.forward_frame();
+    }
+}
+
+impl PointerConstraintsHandler for AppState {
+    fn confined(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wayland_protocols::wp::pointer_constraints::zv1::client::zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn unconfined(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wayland_protocols::wp::pointer_constraints::zv1::client::zwp_confined_pointer_v1::ZwpConfinedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+    }
+
+    fn locked(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+        debug!("pointer lock is active");
+    }
+
+    fn unlocked(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        _: &wl_surface::WlSurface,
+        _: &wl_pointer::WlPointer,
+    ) {
+        // The compositor can drop the lock on its own, e.g. when the surface
+        // loses focus. Capture cannot continue without it.
+        if self.capture.is_some() {
+            warn!("compositor released the pointer lock, ending capture");
+            self.end_capture(None);
+            let _ = self.event_tx.send(WaylandEvent::CaptureLost);
+        }
+    }
+}
+
+impl KeyboardHandler for AppState {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        if self.capture.is_none() {
+            return;
+        }
+        if self.is_panic_key(&event) {
+            warn!("Ctrl+Alt+Escape pressed, force-releasing the capture");
+            self.end_capture(None);
+            let _ = self.event_tx.send(WaylandEvent::CaptureLost);
+            return;
+        }
+        self.forward(EisCommand::Key {
+            keycode: event.raw_code.saturating_sub(EVDEV_OFFSET),
+            press: true,
+        });
+        self.forward_frame();
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: KeyEvent,
+    ) {
+        // Deliberately not forwarded. This is sctk synthesising repeats locally,
+        // and the remote machine already generates its own from the held key, so
+        // passing these along would double every repeat.
+    }
+
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: KeyEvent,
+    ) {
+        if self.capture.is_none() {
+            return;
+        }
+        self.forward(EisCommand::Key {
+            keycode: event.raw_code.saturating_sub(EVDEV_OFFSET),
+            press: false,
+        });
+        self.forward_frame();
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+        self.modifiers = modifiers;
+    }
+
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        keymap: Keymap<'_>,
+    ) {
+        let text = keymap.as_string();
+        debug!("captured a {} byte xkb keymap from niri", text.len());
+        if let Ok(mut slot) = self.keymap.write() {
+            *slot = Some(text);
         }
     }
 }
@@ -350,6 +766,7 @@ smithay_client_toolkit::delegate_dispatch2!(AppState);
 pub fn run(
     cmd_rx: calloop::channel::Channel<WaylandCmd>,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
+    keymap: SharedKeymap,
     ready: &std::sync::mpsc::Sender<Result<()>>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to the Wayland display")?;
@@ -363,6 +780,7 @@ pub fn run(
         .context("niri did not advertise zwlr_layer_shell_v1")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm global is missing")?;
     let pool = SlotPool::new(4096, &shm).context("failed to create an shm pool")?;
+    let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
 
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
@@ -371,9 +789,17 @@ pub fn run(
         shm,
         compositor,
         layer_shell,
+        relative_pointer_state: RelativePointerState::bind(&globals, &qh),
+        pointer_constraints,
         pool,
         pointer: None,
+        relative_pointer: None,
+        keyboard: None,
+        keymap,
+        modifiers: Modifiers::default(),
+        last_enter_serial: 0,
         surfaces: Vec::new(),
+        capture: None,
         event_tx,
         exit: false,
     };
@@ -395,12 +821,14 @@ pub fn run(
             match cmd {
                 WaylandCmd::Arm(barriers) => state.arm(&barriers, &cmd_qh),
                 WaylandCmd::Disarm => state.disarm(),
+                WaylandCmd::AttachEis(eis) => state.attach_eis(eis),
+                WaylandCmd::EndCapture { cursor_hint } => state.end_capture(cursor_hint),
                 WaylandCmd::Shutdown => state.exit = true,
             }
         })
         .map_err(|e| anyhow::anyhow!("failed to register the command channel: {e}"))?;
 
-    // Let the registry settle so outputs are known before the first Arm.
+    // Let the registry settle so outputs and the keymap are known before use.
     event_loop
         .dispatch(std::time::Duration::from_millis(200), &mut state)
         .context("initial Wayland dispatch failed")?;
@@ -415,5 +843,11 @@ pub fn run(
             .context("Wayland dispatch failed")?;
     }
 
+    // Never leave the session with a locked pointer or a grabbed keyboard.
+    state.end_capture(None);
     Ok(())
 }
+
+use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
+use smithay_client_toolkit::reexports::protocols as wayland_protocols;

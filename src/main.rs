@@ -36,10 +36,14 @@ async fn main() -> Result<()> {
         );
     }
 
-    let (wayland, wayland_events) =
-        wayland::spawn().context("failed to start the Wayland barrier thread")?;
+    // The keymap is captured from niri by the Wayland thread and read back when
+    // an EIS keyboard device is created.
+    let keymap: eis_server::SharedKeymap = std::sync::Arc::default();
 
-    let state = portal::State::new(std::sync::Arc::new(wayland));
+    let (wayland, wayland_events) =
+        wayland::spawn(keymap.clone()).context("failed to start the Wayland barrier thread")?;
+
+    let state = portal::State::new(std::sync::Arc::new(wayland), keymap);
     let conn = zbus::connection::Builder::session()
         .context("failed to connect to the session bus")?
         .name(BUS_NAME)

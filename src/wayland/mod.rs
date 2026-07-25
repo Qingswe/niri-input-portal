@@ -48,6 +48,17 @@ pub enum WaylandCmd {
     Arm(Vec<Barrier>),
     /// Tear every barrier surface down, freeing the screen edges.
     Disarm,
+    /// Attach the EIS connection that captured input should be written to.
+    ///
+    /// The pointer is already locked by the time this arrives — locking happens
+    /// the instant the barrier is crossed so no motion is lost to the round trip
+    /// through the portal — so this only hands over the destination.
+    AttachEis(crate::eis_server::EisHandle),
+    /// Release the pointer and give the local cursor back.
+    EndCapture {
+        /// Where to leave the cursor, in global logical coordinates.
+        cursor_hint: Option<(f64, f64)>,
+    },
     Shutdown,
 }
 
@@ -56,6 +67,10 @@ pub enum WaylandCmd {
 pub enum WaylandEvent {
     /// The pointer crossed a barrier. Position is in global logical coordinates.
     Activated { barrier_id: u32, position: (f64, f64) },
+    /// Capture ended without the client asking, so the portal still has to emit
+    /// `Deactivated`. Happens when the compositor drops the lock or the user
+    /// hits the escape combination.
+    CaptureLost,
     /// The output layout changed; zones and barriers are stale.
     OutputsChanged,
 }
@@ -81,14 +96,16 @@ impl Drop for WaylandHandle {
 /// Start the Wayland thread.
 ///
 /// Returns a handle for sending commands plus the stream of barrier events.
-pub fn spawn() -> Result<(WaylandHandle, mpsc::UnboundedReceiver<WaylandEvent>)> {
+pub fn spawn(
+    keymap: crate::eis_server::SharedKeymap,
+) -> Result<(WaylandHandle, mpsc::UnboundedReceiver<WaylandEvent>)> {
     let (cmd_tx, cmd_rx) = calloop::channel::channel::<WaylandCmd>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<WaylandEvent>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
 
     thread::Builder::new()
         .name("wayland-barriers".into())
-        .spawn(move || match state::run(cmd_rx, event_tx, &ready_tx) {
+        .spawn(move || match state::run(cmd_rx, event_tx, keymap, &ready_tx) {
             Ok(()) => info!("Wayland barrier thread stopped"),
             Err(err) => {
                 // If startup failed the error goes to `ready_rx`; a later failure

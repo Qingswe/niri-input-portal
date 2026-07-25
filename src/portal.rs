@@ -96,18 +96,20 @@ pub struct State {
     next_zone_set: Arc<AtomicU32>,
     next_activation: Arc<AtomicU32>,
     wayland: Arc<WaylandHandle>,
+    keymap: eis_server::SharedKeymap,
     /// Filled in once the bus connection exists, which is after the interface
     /// itself has to be constructed.
     conn: Arc<OnceLock<zbus::Connection>>,
 }
 
 impl State {
-    pub fn new(wayland: Arc<WaylandHandle>) -> Self {
+    pub fn new(wayland: Arc<WaylandHandle>, keymap: eis_server::SharedKeymap) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_zone_set: Arc::new(AtomicU32::new(1)),
             next_activation: Arc::new(AtomicU32::new(1)),
             wayland,
+            keymap,
             conn: Arc::new(OnceLock::new()),
         }
     }
@@ -352,8 +354,12 @@ impl InputCapture {
         let (ours, theirs) = UnixStream::pair()
             .map_err(|e| zbus::fdo::Error::Failed(format!("socketpair failed: {e}")))?;
 
-        let handle = eis_server::spawn(ours, session_handle.as_str().to_owned())
-            .map_err(|e| zbus::fdo::Error::Failed(format!("EIS setup failed: {e:#}")))?;
+        let handle = eis_server::spawn(
+            ours,
+            session_handle.as_str().to_owned(),
+            self.state.keymap.clone(),
+        )
+        .map_err(|e| zbus::fdo::Error::Failed(format!("EIS setup failed: {e:#}")))?;
         session.eis = Some(handle);
 
         info!(%app_id, session = %session_handle.as_str(), "handed EIS socket to client");
@@ -422,8 +428,11 @@ impl InputCapture {
         session.activation_id = 0;
         info!(%app_id, ?cursor, "capture released");
 
-        // Barriers were torn down on activation so the pointer could settle back
-        // on the local screen; put them back now that capture has ended.
+        // Unlock the pointer first, then rebuild the barriers so the pointer is
+        // back under local control before an edge can trigger again.
+        self.state
+            .wayland
+            .send(WaylandCmd::EndCapture { cursor_hint: cursor });
         if session.enabled {
             self.state
                 .wayland
@@ -530,13 +539,11 @@ pub async fn activate(
             eis.send(eis_server::EisCommand::StartEmulating {
                 sequence: activation_id,
             });
+            // The Wayland thread already locked the pointer; this tells it where
+            // to send what it captures.
+            state.wayland.send(WaylandCmd::AttachEis(eis.clone()));
         }
     }
-
-    // The pointer is sitting on the barrier surface right now. Leaving it there
-    // would re-trigger on every enter, so drop the surfaces for the duration of
-    // the capture; `Release` puts them back.
-    state.wayland.send(WaylandCmd::Disarm);
 
     let emitter = SignalEmitter::new(conn, PORTAL_PATH)?;
     let mut options: HashMap<String, Value<'_>> = HashMap::new();
@@ -566,6 +573,24 @@ pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiv
                 };
                 if let Err(err) = activate(&state, &conn, &handle, barrier_id, position).await {
                     error!(barrier_id, "failed to emit Activated: {err}");
+                }
+            }
+            WaylandEvent::CaptureLost => {
+                // The grab is already gone; tell whichever session owned it so
+                // the client stops expecting events, and put the barriers back.
+                let active: Vec<(OwnedObjectPath, Vec<Barrier>)> = {
+                    let sessions = state.sessions.lock().await;
+                    sessions
+                        .values()
+                        .filter(|s| s.activation_id != 0)
+                        .map(|s| (s.handle.clone(), s.barriers.clone()))
+                        .collect()
+                };
+                for (handle, barriers) in active {
+                    if let Err(err) = deactivate(&state, &conn, &handle, (0.0, 0.0)).await {
+                        error!("failed to emit Deactivated: {err}");
+                    }
+                    state.wayland.send(WaylandCmd::Arm(barriers));
                 }
             }
             WaylandEvent::OutputsChanged => {

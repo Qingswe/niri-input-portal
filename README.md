@@ -35,10 +35,40 @@ does support (`wlr-layer-shell`, `pointer-constraints`, `relative-pointer`).
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Portal session + client reaches EIS | **done, verified** |
-| 2 | Pointer barriers, emit `Activated` | not started |
-| 3 | Forward relative motion, keys, scroll | not started |
-| 4 | `Release` + restore the local cursor | not started |
-| 5 | Multi-output, scale, transform, hotplug | partial (zones are correct) |
+| 2 | Pointer barriers, emit `Activated` | **done, verified** |
+| 3 | Forward relative motion, keys, scroll | **done**, not yet verified against a remote screen |
+| 4 | `Release` + restore the local cursor | partial — see below |
+| 5 | Multi-output, scale, transform, hotplug | partial (zones and barrier placement are correct) |
+
+## How capture works
+
+A barrier is a one-pixel transparent `wlr-layer-shell` surface on the overlay
+layer, pinned to the matching output edge. Crossing it means:
+
+1. The pointer enters that surface. The Wayland thread locks the pointer to it
+   with `zwp_locked_pointer_v1` **immediately**, before telling the portal
+   anything, so no motion leaks onto the local screen during the D-Bus round
+   trip. Events observed before the EIS handle arrives are buffered and flushed.
+2. The layer surface switches to `KeyboardInteractivity::Exclusive`, which is
+   what lets keystrokes reach the remote screen instead of the locally focused
+   window.
+3. The cursor image is hidden, so the screen looks like the pointer really left.
+4. `zwp_relative_pointer_v1` deltas, buttons, scroll and keys are written to the
+   session's EIS connection. The EIS `start_emulating` sequence is set to the
+   same value as the portal's `activation_id`, which is what lets the client
+   attribute an event stream to one activation.
+
+`Release` destroys the lock, drops the keyboard grab and rearms the barriers.
+
+### Escape hatch
+
+An exclusive keyboard grab plus a locked pointer is not something to be stuck
+in. If the client stops calling `Release` — it crashed, or the remote screen
+never connected — **Ctrl+Alt+Escape** force-releases the capture locally. That
+combination is swallowed rather than forwarded.
+
+The Wayland thread also ends the capture by itself if the compositor drops the
+lock, if the output the barrier lives on disappears, or on shutdown.
 
 Phase 1 verified against real `synergy-core` 1.21.1-beta:
 
@@ -122,10 +152,18 @@ Set `NIRI_INPUT_PORTAL_LOG=debug` for per-call tracing.
 
 ## Known gaps
 
-- Keyboard devices are created without an xkb keymap, so deskflow logs
-  "does not have a keymap, we are guessing" and assumes a default layout.
+- `Release`'s `cursor_position` hint is passed to `set_cursor_position_hint`, but
+  the barrier surface is one pixel wide, so the hint can only move the cursor
+  *along* the edge rather than back into the screen. Returning from a remote
+  screen therefore leaves the cursor pinned at the edge. Doing this properly
+  needs a wider surface that is grown for the release.
 - `org.freedesktop.impl.portal.Request` objects are not exported, so in-flight
   calls cannot be cancelled. Harmless today because every handler returns
   immediately.
 - niri's own compositor keybindings (`Mod`+…) are consumed before any client sees
   them, so those combinations cannot be forwarded to a remote screen.
+- Barrier surfaces occupy the outermost pixel column or row of an output while
+  armed, so a click landing exactly there is swallowed.
+- Output scale and transform are read but not applied to motion deltas; on a
+  fractionally scaled output the remote pointer speed will not match the local
+  one exactly.

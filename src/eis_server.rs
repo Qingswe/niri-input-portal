@@ -17,7 +17,9 @@ use reis::{
     PendingRequestResult,
 };
 use std::{
+    os::fd::{AsFd, OwnedFd},
     os::unix::net::UnixStream,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc};
@@ -56,13 +58,6 @@ impl EisHandle {
         }
     }
 
-    /// Emit a batch and close the frame in one call.
-    pub fn send_frame(&self, cmds: impl IntoIterator<Item = EisCommand>) {
-        for cmd in cmds {
-            self.send(cmd);
-        }
-        self.send(EisCommand::Frame);
-    }
 }
 
 /// Devices we hand the client once it binds a seat.
@@ -181,13 +176,20 @@ impl Devices {
     }
 }
 
+/// The compositor's current xkb keymap, shared with the Wayland thread.
+///
+/// Devices are created when the client binds a seat, which can happen before or
+/// after the keymap is known, so this is read at device-creation time rather
+/// than passed in.
+pub type SharedKeymap = Arc<RwLock<Option<String>>>;
+
 /// Take over one end of a socketpair and serve EIS on it.
-pub fn spawn(socket: UnixStream, label: String) -> Result<EisHandle> {
+pub fn spawn(socket: UnixStream, label: String, keymap: SharedKeymap) -> Result<EisHandle> {
     let context = eis::Context::new(socket).context("failed to create EIS context")?;
     let (tx, rx) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
-        if let Err(err) = run(context, rx, &label).await {
+        if let Err(err) = run(context, rx, &label, &keymap).await {
             warn!(session = %label, "EIS connection ended: {err:#}");
         } else {
             info!(session = %label, "EIS connection closed");
@@ -197,10 +199,28 @@ pub fn spawn(socket: UnixStream, label: String) -> Result<EisHandle> {
     Ok(EisHandle { tx })
 }
 
+/// Copy the keymap into a sealed memfd for handing to the client.
+fn keymap_fd(keymap: &str) -> Option<(OwnedFd, u32)> {
+    use std::io::Write;
+
+    let fd = rustix::fs::memfd_create("niri-input-keymap", rustix::fs::MemfdFlags::CLOEXEC)
+        .map_err(|e| warn!("memfd_create failed: {e}"))
+        .ok()?;
+    let mut file = std::fs::File::from(fd);
+    // xkb keymaps passed over a file descriptor are NUL-terminated.
+    file.write_all(keymap.as_bytes()).ok()?;
+    file.write_all(b"\0").ok()?;
+    file.flush().ok()?;
+
+    let size = u32::try_from(keymap.len() + 1).ok()?;
+    Some((file.into(), size))
+}
+
 async fn run(
     context: eis::Context,
     mut rx: mpsc::UnboundedReceiver<EisCommand>,
     label: &str,
+    keymap: &SharedKeymap,
 ) -> Result<()> {
     let started = Instant::now();
     let async_fd = AsyncFd::with_interest(context.clone(), tokio::io::Interest::READABLE)
@@ -249,6 +269,7 @@ async fn run(
                             &mut devices,
                             &mut sequence,
                             label,
+                            keymap,
                         )? {
                             return Ok(());
                         }
@@ -316,6 +337,7 @@ fn drive_requests(
     devices: &mut Devices,
     sequence: &mut u32,
     label: &str,
+    keymap: &SharedKeymap,
 ) -> Result<bool> {
     while let Some(result) = context.pending_request() {
         let request = match result {
@@ -347,15 +369,18 @@ fn drive_requests(
                             &bind.seat,
                             conn,
                             sequence,
+                            None,
                         ));
                     }
                     if devices.keyboard.is_none() && caps.contains(DeviceCapability::Keyboard) {
+                        let map = keymap.read().ok().and_then(|k| k.clone());
                         devices.keyboard = Some(add_device(
                             "niri-capture-keyboard",
                             DeviceCapability::Keyboard.into(),
                             &bind.seat,
                             conn,
                             sequence,
+                            map.as_deref(),
                         ));
                     }
                 }
@@ -372,12 +397,26 @@ fn add_device(
     seat: &reis::request::Seat,
     conn: &Connection,
     sequence: &mut u32,
+    keymap: Option<&str>,
 ) -> reis::request::Device {
-    // TODO(phase 3): send the xkb keymap for keyboard devices via
-    // `eis::Keyboard::keymap` inside this callback. Without it deskflow logs
-    // "does not have a keymap, we are guessing" and falls back to a default
-    // layout, which mistranslates any non-US keycode on the remote screen.
-    let device = seat.add_device(Some(name), DeviceType::Virtual, capabilities, |_| {});
+    let device = seat.add_device(Some(name), DeviceType::Virtual, capabilities, |dev| {
+        // The keymap has to go out before ei_device.done, which is exactly what
+        // this callback is for. Without it deskflow logs "does not have a
+        // keymap, we are guessing" and assumes a US layout, mistranslating every
+        // non-US keycode on the remote screen.
+        // Only keyboard devices carry a keymap; pointers legitimately have none.
+        let Some(kb) = dev.interface::<eis::Keyboard>() else {
+            return;
+        };
+        let Some(keymap) = keymap else {
+            warn!("no keymap captured from niri yet; the client will guess a layout");
+            return;
+        };
+        if let Some((fd, size)) = keymap_fd(keymap) {
+            kb.keymap(eis::keyboard::KeymapType::Xkb, size, fd.as_fd());
+            debug!("sent a {size} byte xkb keymap to the client");
+        }
+    });
     device.resumed();
     // A receiver context expects the device to be emulating before events flow.
     // We do not start here — capture has not been activated yet — but record the
