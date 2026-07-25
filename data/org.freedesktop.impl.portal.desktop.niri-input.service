@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.niri-input
+Exec=/usr/lib/niri-input-portal
+SystemdService=niri-input-portal.service

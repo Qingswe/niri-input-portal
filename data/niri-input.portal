@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.niri-input
+Interfaces=org.freedesktop.impl.portal.InputCapture;
+UseIn=niri

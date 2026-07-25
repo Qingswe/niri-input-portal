@@ -1,0 +1,18 @@
+[package]
+name = "niri-input-portal"
+version = "0.1.0"
+edition = "2024"
+description = "xdg-desktop-portal InputCapture backend for the niri compositor"
+license = "MIT"
+
+[dependencies]
+zbus = { version = "5.18", default-features = false, features = ["tokio"] }
+zvariant = "5"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "process", "io-util"] }
+reis = { version = "0.7", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
