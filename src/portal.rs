@@ -8,16 +8,17 @@
 use crate::{
     eis_server::{self, EisHandle},
     niri,
+    wayland::{WaylandCmd, WaylandEvent, WaylandHandle},
 };
 use std::{
     collections::HashMap,
     os::unix::net::UnixStream,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 use zbus::{interface, object_server::SignalEmitter, zvariant};
 use zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Type, Value};
@@ -94,21 +95,42 @@ pub struct State {
     sessions: Arc<Mutex<HashMap<OwnedObjectPath, Session>>>,
     next_zone_set: Arc<AtomicU32>,
     next_activation: Arc<AtomicU32>,
+    wayland: Arc<WaylandHandle>,
+    /// Filled in once the bus connection exists, which is after the interface
+    /// itself has to be constructed.
+    conn: Arc<OnceLock<zbus::Connection>>,
 }
 
 impl State {
-    pub fn new() -> Self {
+    pub fn new(wayland: Arc<WaylandHandle>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_zone_set: Arc::new(AtomicU32::new(1)),
             next_activation: Arc::new(AtomicU32::new(1)),
+            wayland,
+            conn: Arc::new(OnceLock::new()),
         }
     }
-}
 
-impl Default for State {
-    fn default() -> Self {
-        Self::new()
+    pub fn set_connection(&self, conn: zbus::Connection) {
+        let _ = self.conn.set(conn);
+    }
+
+    fn connection(&self) -> Option<&zbus::Connection> {
+        self.conn.get()
+    }
+
+    /// Find the enabled session that owns `barrier_id`.
+    async fn session_for_barrier(&self, barrier_id: u32) -> Option<OwnedObjectPath> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .values()
+            .find(|s| s.enabled && s.barriers.iter().any(|b| b.id == barrier_id))
+            .map(|s| s.handle.clone())
+    }
+
+    async fn session_handles(&self) -> Vec<OwnedObjectPath> {
+        self.sessions.lock().await.keys().cloned().collect()
     }
 }
 
@@ -354,6 +376,9 @@ impl InputCapture {
         }
         session.enabled = true;
         info!(%app_id, barriers = session.barriers.len(), "capture enabled");
+        self.state
+            .wayland
+            .send(WaylandCmd::Arm(session.barriers.clone()));
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -370,6 +395,9 @@ impl InputCapture {
         session.enabled = false;
         session.activation_id = 0;
         info!(%app_id, "capture disabled");
+        // Free the screen edges; leaving the surfaces up would keep swallowing
+        // clicks on the edge pixel column for no reason.
+        self.state.wayland.send(WaylandCmd::Disarm);
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -393,6 +421,14 @@ impl InputCapture {
         }
         session.activation_id = 0;
         info!(%app_id, ?cursor, "capture released");
+
+        // Barriers were torn down on activation so the pointer could settle back
+        // on the local screen; put them back now that capture has ended.
+        if session.enabled {
+            self.state
+                .wayland
+                .send(WaylandCmd::Arm(session.barriers.clone()));
+        }
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -466,7 +502,6 @@ fn insert(map: &mut Results, key: &str, value: Value<'_>) {
 }
 
 /// Emit `Activated` for a session and start the EIS event stream.
-#[allow(dead_code)]
 pub async fn activate(
     state: &State,
     conn: &zbus::Connection,
@@ -484,6 +519,10 @@ pub async fn activate(
         if !session.enabled {
             return Ok(());
         }
+        if session.activation_id != 0 {
+            // Already capturing; a second crossing is noise.
+            return Ok(());
+        }
         session.activation_id = activation_id;
         if let Some(eis) = &session.eis {
             // The EIS sequence must equal the activation_id so the client can
@@ -494,6 +533,11 @@ pub async fn activate(
         }
     }
 
+    // The pointer is sitting on the barrier surface right now. Leaving it there
+    // would re-trigger on every enter, so drop the surfaces for the duration of
+    // the capture; `Release` puts them back.
+    state.wayland.send(WaylandCmd::Disarm);
+
     let emitter = SignalEmitter::new(conn, PORTAL_PATH)?;
     let mut options: HashMap<String, Value<'_>> = HashMap::new();
     options.insert("activation_id".into(), Value::from(activation_id));
@@ -501,6 +545,45 @@ pub async fn activate(
     options.insert("cursor_position".into(), Value::from((cursor.0, cursor.1)));
 
     InputCapture::activated(&emitter, session_handle.as_ref(), options).await
+}
+
+/// Drive portal signals from what the Wayland thread observes.
+pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiver<WaylandEvent>) {
+    while let Some(event) = events.recv().await {
+        let Some(conn) = state.connection().cloned() else {
+            warn!("dropping a Wayland event: the bus connection is not up yet");
+            continue;
+        };
+
+        match event {
+            WaylandEvent::Activated {
+                barrier_id,
+                position,
+            } => {
+                let Some(handle) = state.session_for_barrier(barrier_id).await else {
+                    debug!(barrier_id, "no enabled session owns this barrier");
+                    continue;
+                };
+                if let Err(err) = activate(&state, &conn, &handle, barrier_id, position).await {
+                    error!(barrier_id, "failed to emit Activated: {err}");
+                }
+            }
+            WaylandEvent::OutputsChanged => {
+                // Zones are stale for every session; the spec says clients must
+                // call GetZones again as soon as they see this.
+                for handle in state.session_handles().await {
+                    let Ok(emitter) = SignalEmitter::new(&conn, PORTAL_PATH) else {
+                        continue;
+                    };
+                    if let Err(err) =
+                        InputCapture::zones_changed(&emitter, handle.as_ref(), HashMap::new()).await
+                    {
+                        error!("failed to emit ZonesChanged: {err}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Emit `Deactivated` and stop the EIS event stream.

@@ -7,6 +7,7 @@
 mod eis_server;
 mod niri;
 mod portal;
+mod wayland;
 
 use anyhow::{Context, Result};
 use tracing::info;
@@ -35,16 +36,24 @@ async fn main() -> Result<()> {
         );
     }
 
-    let state = portal::State::new();
-    let _conn = zbus::connection::Builder::session()
+    let (wayland, wayland_events) =
+        wayland::spawn().context("failed to start the Wayland barrier thread")?;
+
+    let state = portal::State::new(std::sync::Arc::new(wayland));
+    let conn = zbus::connection::Builder::session()
         .context("failed to connect to the session bus")?
         .name(BUS_NAME)
         .context("failed to claim the backend bus name")?
-        .serve_at(PORTAL_PATH, portal::InputCapture::new(state))
+        .serve_at(PORTAL_PATH, portal::InputCapture::new(state.clone()))
         .context("failed to export the InputCapture interface")?
         .build()
         .await
         .context("failed to start the D-Bus service")?;
+
+    // Signals are emitted against this connection, so the state cannot learn
+    // about it until the service is up.
+    state.set_connection(conn);
+    tokio::spawn(portal::pump_wayland_events(state, wayland_events));
 
     info!("{BUS_NAME} ready at {PORTAL_PATH}");
 
