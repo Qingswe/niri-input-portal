@@ -60,6 +60,14 @@ struct Capture {
     eis: Option<EisHandle>,
     /// Events observed before the EIS handle arrived.
     pending: Vec<EisCommand>,
+    /// Counted per kind so a capture that produced nothing is distinguishable
+    /// from one that was never wired up.
+    motions: u32,
+    keys: u32,
+    buttons: u32,
+    scrolls: u32,
+    /// Last time anything at all was captured, for the idle watchdog.
+    last_input: std::time::Instant,
 }
 
 struct AppState {
@@ -80,6 +88,8 @@ struct AppState {
     last_enter_serial: u32,
     surfaces: Vec<BarrierSurface>,
     capture: Option<Capture>,
+    /// How long a capture may see no input at all before it is force-released.
+    idle_timeout: std::time::Duration,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
     exit: bool,
 }
@@ -252,6 +262,11 @@ impl AppState {
             origin,
             eis: None,
             pending: Vec::new(),
+            motions: 0,
+            keys: 0,
+            buttons: 0,
+            scrolls: 0,
+            last_input: std::time::Instant::now(),
         });
 
         let _ = self.event_tx.send(WaylandEvent::Activated {
@@ -302,7 +317,14 @@ impl AppState {
             // Hand the cursor image back to the compositor default.
             pointer.set_cursor(self.last_enter_serial, None, 0, 0);
         }
-        info!(barrier = capture.barrier_id, "capture ended, pointer released");
+        info!(
+            barrier = capture.barrier_id,
+            motions = capture.motions,
+            keys = capture.keys,
+            buttons = capture.buttons,
+            scrolls = capture.scrolls,
+            "capture ended, pointer released"
+        );
     }
 
     /// Route one event to the client, buffering if EIS is not attached yet.
@@ -310,6 +332,30 @@ impl AppState {
         let Some(capture) = &mut self.capture else {
             return;
         };
+        // Frames are bookkeeping and carry no user intent, so they must not feed
+        // the idle watchdog — otherwise it could never fire.
+        let is_input = match &cmd {
+            EisCommand::Motion { .. } => {
+                capture.motions += 1;
+                true
+            }
+            EisCommand::Key { .. } => {
+                capture.keys += 1;
+                true
+            }
+            EisCommand::Button { .. } => {
+                capture.buttons += 1;
+                true
+            }
+            EisCommand::Scroll { .. } | EisCommand::ScrollDiscrete { .. } => {
+                capture.scrolls += 1;
+                true
+            }
+            _ => false,
+        };
+        if is_input {
+            capture.last_input = std::time::Instant::now();
+        }
         match &capture.eis {
             Some(eis) => eis.send(cmd),
             None => capture.pending.push(cmd),
@@ -320,13 +366,36 @@ impl AppState {
         self.forward(EisCommand::Frame);
     }
 
-    /// The local escape hatch out of an exclusive keyboard grab.
+    /// Best-effort keyboard escape.
     ///
-    /// If the client stops calling Release the pointer stays locked and the
-    /// keyboard stays grabbed, which would otherwise need a kill from another
-    /// machine to undo.
+    /// Do not rely on this: niri handles compositor bindings before clients see
+    /// them, so a combination it claims never arrives here. It is a convenience
+    /// for the cases it does work in, not a safety mechanism — the watchdog and
+    /// the `ForceRelease` D-Bus method are the ones that always work.
     fn is_panic_key(&self, event: &KeyEvent) -> bool {
         self.modifiers.ctrl && self.modifiers.alt && event.keysym == Keysym::Escape
+    }
+
+    /// Force-release a capture that has gone quiet.
+    ///
+    /// A capture that is working generates a constant stream of input, because
+    /// the user is driving the remote screen with this machine's own devices.
+    /// Silence means the input is going nowhere and the pointer is stranded.
+    fn check_watchdog(&mut self) {
+        let Some(capture) = &self.capture else {
+            return;
+        };
+        let idle = capture.last_input.elapsed();
+        if idle < self.idle_timeout {
+            return;
+        }
+        warn!(
+            barrier = capture.barrier_id,
+            idle_secs = idle.as_secs(),
+            "no captured input for the idle timeout, force-releasing the pointer"
+        );
+        self.end_capture(None);
+        let _ = self.event_tx.send(WaylandEvent::CaptureLost);
     }
 }
 
@@ -767,6 +836,7 @@ pub fn run(
     cmd_rx: calloop::channel::Channel<WaylandCmd>,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
     keymap: SharedKeymap,
+    idle_timeout: std::time::Duration,
     ready: &std::sync::mpsc::Sender<Result<()>>,
 ) -> Result<()> {
     let conn = Connection::connect_to_env().context("failed to connect to the Wayland display")?;
@@ -800,6 +870,7 @@ pub fn run(
         last_enter_serial: 0,
         surfaces: Vec::new(),
         capture: None,
+        idle_timeout,
         event_tx,
         exit: false,
     };
@@ -841,6 +912,8 @@ pub fn run(
         event_loop
             .dispatch(std::time::Duration::from_millis(200), &mut state)
             .context("Wayland dispatch failed")?;
+        // The dispatch timeout doubles as the watchdog tick.
+        state.check_watchdog();
     }
 
     // Never leave the session with a locked pointer or a grabbed keyboard.

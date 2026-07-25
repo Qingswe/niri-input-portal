@@ -60,15 +60,53 @@ layer, pinned to the matching output edge. Crossing it means:
 
 `Release` destroys the lock, drops the keyboard grab and rearms the barriers.
 
-### Escape hatch
+## Getting unstuck
 
-An exclusive keyboard grab plus a locked pointer is not something to be stuck
-in. If the client stops calling `Release` — it crashed, or the remote screen
-never connected — **Ctrl+Alt+Escape** force-releases the capture locally. That
-combination is swallowed rather than forwarded.
+An exclusive keyboard grab plus a locked pointer is not a state to be stranded
+in, and the portal protocol has no acknowledgement that would let this process
+tell a working capture from a broken one. So the escapes are out-of-band.
 
-The Wayland thread also ends the capture by itself if the compositor drops the
-lock, if the output the barrier lives on disappears, or on shutdown.
+**Do not rely on a key handler inside this process.** An earlier version used
+Ctrl+Alt+Escape handled in `KeyboardHandler`, which does not work: niri resolves
+its own bindings before clients see them, so a combination niri claims never
+arrives, and one it does not claim arrives only if the grab is already
+functioning. Using the grabbed keyboard to escape the grab is circular.
+
+The escapes that do work, in order of convenience:
+
+1. **A niri keybinding.** This is the reliable one, precisely *because* niri
+   handles its bindings ahead of clients. Add to your niri config:
+
+   ```kdl
+   Mod+Shift+Escape allow-inhibiting=false { spawn "/usr/lib/niri-input-portal" "--release"; }
+   ```
+
+   `allow-inhibiting=false` keeps it working even if a client asks to inhibit
+   shortcuts.
+
+2. **From another machine or a TTY**, over SSH:
+
+   ```sh
+   niri-input-portal --release   # drop the capture, keep the barriers
+   niri-input-portal --disarm    # drop the capture and clear the screen edges
+   niri-input-portal --status    # what does it think is going on
+   ```
+
+3. **Kill the process.** `pkill -f niri-input-portal` always works: the
+   compositor destroys the surface and with it the pointer lock as soon as the
+   client disconnects.
+
+Automatic releases, needing no intervention:
+
+- The EIS connection dying. A capture feeding a dead socket can never be ended
+  by its client, which is exactly the case where the remote screen was never
+  connected.
+- An idle watchdog, default 15s, set with `NIRI_INPUT_PORTAL_IDLE_TIMEOUT`
+  (seconds, `0` disables). A working capture never goes quiet for that long,
+  because the user is driving the remote screen from this machine. Note this is
+  a backstop, not a primary escape: someone hammering keys to get free would
+  keep resetting it.
+- The compositor dropping the lock, the output disappearing, or shutdown.
 
 Phase 1 verified against real `synergy-core` 1.21.1-beta:
 

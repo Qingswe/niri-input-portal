@@ -96,8 +96,36 @@ impl Drop for WaylandHandle {
 /// Start the Wayland thread.
 ///
 /// Returns a handle for sending commands plus the stream of barrier events.
+/// Default idle timeout before a capture is force-released.
+///
+/// A capture that is doing its job never goes quiet for this long, because the
+/// user is driving the remote screen with this machine's own mouse and keyboard.
+pub const DEFAULT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Read the idle timeout from the environment, falling back to the default.
+///
+/// `0` disables the watchdog, which is only sensible when something else is
+/// guaranteed to end the capture.
+pub fn idle_timeout_from_env() -> std::time::Duration {
+    match std::env::var("NIRI_INPUT_PORTAL_IDLE_TIMEOUT") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                warn!("idle watchdog disabled; a stuck capture will need ForceRelease");
+                std::time::Duration::MAX
+            }
+            Ok(secs) => std::time::Duration::from_secs(secs),
+            Err(_) => {
+                warn!("ignoring unparseable NIRI_INPUT_PORTAL_IDLE_TIMEOUT={raw:?}");
+                DEFAULT_IDLE_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_IDLE_TIMEOUT,
+    }
+}
+
 pub fn spawn(
     keymap: crate::eis_server::SharedKeymap,
+    idle_timeout: std::time::Duration,
 ) -> Result<(WaylandHandle, mpsc::UnboundedReceiver<WaylandEvent>)> {
     let (cmd_tx, cmd_rx) = calloop::channel::channel::<WaylandCmd>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<WaylandEvent>();
@@ -105,7 +133,7 @@ pub fn spawn(
 
     thread::Builder::new()
         .name("wayland-barriers".into())
-        .spawn(move || match state::run(cmd_rx, event_tx, keymap, &ready_tx) {
+        .spawn(move || match state::run(cmd_rx, event_tx, keymap, idle_timeout, &ready_tx) {
             Ok(()) => info!("Wayland barrier thread stopped"),
             Err(err) => {
                 // If startup failed the error goes to `ready_rx`; a later failure

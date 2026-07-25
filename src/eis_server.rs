@@ -184,7 +184,16 @@ impl Devices {
 pub type SharedKeymap = Arc<RwLock<Option<String>>>;
 
 /// Take over one end of a socketpair and serve EIS on it.
-pub fn spawn(socket: UnixStream, label: String, keymap: SharedKeymap) -> Result<EisHandle> {
+///
+/// `closed_tx` receives the session label when the connection dies for any
+/// reason. A capture must never outlive the connection it feeds — that is how
+/// the pointer ends up locked with nothing able to release it.
+pub fn spawn(
+    socket: UnixStream,
+    label: String,
+    keymap: SharedKeymap,
+    closed_tx: mpsc::UnboundedSender<String>,
+) -> Result<EisHandle> {
     let context = eis::Context::new(socket).context("failed to create EIS context")?;
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -194,6 +203,7 @@ pub fn spawn(socket: UnixStream, label: String, keymap: SharedKeymap) -> Result<
         } else {
             info!(session = %label, "EIS connection closed");
         }
+        let _ = closed_tx.send(label);
     });
 
     Ok(EisHandle { tx })

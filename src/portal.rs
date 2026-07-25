@@ -97,21 +97,29 @@ pub struct State {
     next_activation: Arc<AtomicU32>,
     wayland: Arc<WaylandHandle>,
     keymap: eis_server::SharedKeymap,
+    /// Signalled by each EIS task when its connection dies.
+    eis_closed: mpsc::UnboundedSender<String>,
     /// Filled in once the bus connection exists, which is after the interface
     /// itself has to be constructed.
     conn: Arc<OnceLock<zbus::Connection>>,
 }
 
 impl State {
-    pub fn new(wayland: Arc<WaylandHandle>, keymap: eis_server::SharedKeymap) -> Self {
-        Self {
+    pub fn new(
+        wayland: Arc<WaylandHandle>,
+        keymap: eis_server::SharedKeymap,
+    ) -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (eis_closed, closed_rx) = mpsc::unbounded_channel();
+        let state = Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_zone_set: Arc::new(AtomicU32::new(1)),
             next_activation: Arc::new(AtomicU32::new(1)),
             wayland,
             keymap,
+            eis_closed,
             conn: Arc::new(OnceLock::new()),
-        }
+        };
+        (state, closed_rx)
     }
 
     pub fn set_connection(&self, conn: zbus::Connection) {
@@ -133,6 +141,14 @@ impl State {
 
     async fn session_handles(&self) -> Vec<OwnedObjectPath> {
         self.sessions.lock().await.keys().cloned().collect()
+    }
+
+    /// Unlock the pointer and clear the screen edges. Used on shutdown so the
+    /// session is never left with a grab owned by a process that is going away.
+    pub fn release_everything(&self) {
+        self.wayland
+            .send(WaylandCmd::EndCapture { cursor_hint: None });
+        self.wayland.send(WaylandCmd::Disarm);
     }
 }
 
@@ -358,6 +374,7 @@ impl InputCapture {
             ours,
             session_handle.as_str().to_owned(),
             self.state.keymap.clone(),
+            self.state.eis_closed.clone(),
         )
         .map_err(|e| zbus::fdo::Error::Failed(format!("EIS setup failed: {e:#}")))?;
         session.eis = Some(handle);
@@ -468,6 +485,128 @@ impl InputCapture {
         session_handle: ObjectPath<'_>,
         options: HashMap<String, Value<'_>>,
     ) -> zbus::Result<()>;
+}
+
+/// Out-of-band control, deliberately not on the spec interface.
+///
+/// This exists because every in-band escape can fail: the keyboard is grabbed,
+/// the pointer is locked, and the client that is supposed to call `Release` may
+/// be the thing that is broken. A D-Bus call works over SSH from another
+/// machine, which is the only channel guaranteed to still be reachable.
+pub struct Control {
+    state: State,
+}
+
+impl Control {
+    pub fn new(state: State) -> Self {
+        Self { state }
+    }
+}
+
+#[interface(name = "io.github.niri_input_portal.Control")]
+impl Control {
+    /// Drop any active capture and give the pointer and keyboard back.
+    async fn force_release(&self) -> String {
+        // Logged unconditionally: when someone reaches for this, knowing the
+        // call arrived at all is the first thing worth confirming.
+        info!("ForceRelease requested");
+        let released = force_release_all(&self.state).await;
+        if released.is_empty() {
+            "no capture was active; barriers left as they were".to_owned()
+        } else {
+            format!("released {} capture(s)", released.len())
+        }
+    }
+
+    /// Drop captures *and* tear the barrier surfaces down, so no edge can
+    /// trigger again until a client re-enables.
+    async fn disarm(&self) -> String {
+        let released = force_release_all(&self.state).await;
+        self.state.wayland.send(WaylandCmd::Disarm);
+        format!(
+            "released {} capture(s) and disarmed all barriers",
+            released.len()
+        )
+    }
+
+    /// Human-readable summary, for checking state without a GUI.
+    async fn status(&self) -> String {
+        let sessions = self.state.sessions.lock().await;
+        if sessions.is_empty() {
+            return "no sessions".to_owned();
+        }
+        sessions
+            .values()
+            .map(|s| {
+                format!(
+                    "{}: enabled={} barriers={} capturing={}",
+                    s.handle.as_str(),
+                    s.enabled,
+                    s.barriers.len(),
+                    s.activation_id != 0
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// End every in-flight capture, returning the sessions that were active.
+async fn force_release_all(state: &State) -> Vec<OwnedObjectPath> {
+    let active: Vec<OwnedObjectPath> = {
+        let mut sessions = state.sessions.lock().await;
+        let handles: Vec<OwnedObjectPath> = sessions
+            .values()
+            .filter(|s| s.activation_id != 0)
+            .map(|s| s.handle.clone())
+            .collect();
+        for handle in &handles {
+            if let Some(session) = sessions.get_mut(handle) {
+                session.activation_id = 0;
+                if let Some(eis) = &session.eis {
+                    eis.send(eis_server::EisCommand::StopEmulating);
+                }
+            }
+        }
+        handles
+    };
+
+    // Unlock first; the client being told afterwards is fine, the point is that
+    // the local pointer comes back regardless of what the client does.
+    state.wayland.send(WaylandCmd::EndCapture { cursor_hint: None });
+
+    if let Some(conn) = state.connection() {
+        for handle in &active {
+            let Ok(emitter) = SignalEmitter::new(conn, PORTAL_PATH) else {
+                continue;
+            };
+            let mut options: HashMap<String, Value<'_>> = HashMap::new();
+            options.insert("activation_id".into(), Value::from(0u32));
+            let _ = InputCapture::deactivated(&emitter, handle.as_ref(), options).await;
+        }
+    }
+
+    if !active.is_empty() {
+        warn!("force-released {} capture(s)", active.len());
+    }
+    active
+}
+
+/// React to an EIS connection dying: a capture feeding a dead socket can never
+/// be ended by its client, so it has to be ended here.
+pub async fn handle_eis_closed(state: State, mut closed: mpsc::UnboundedReceiver<String>) {
+    while let Some(label) = closed.recv().await {
+        let was_capturing = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .values()
+                .any(|s| s.handle.as_str() == label && s.activation_id != 0)
+        };
+        if was_capturing {
+            warn!(session = %label, "EIS connection died mid-capture, releasing the pointer");
+            force_release_all(&state).await;
+        }
+    }
 }
 
 /// The impl-side Session object xdg-desktop-portal closes when it is done.
