@@ -55,6 +55,8 @@ capture enabled                barriers=2
 `synergy-core` now reaches `connection state: Listening` and stays up, instead of
 exiting after 0.13s in a restart loop.
 
+Installed and verified on niri 25.11, xdg-desktop-portal 1.20.4, libei 1.5.0.
+
 **Capture does not work yet.** Barriers are accepted and stored but nothing watches
 them, so moving the pointer at a screen edge will not switch to the remote machine.
 That is phase 2 and 3.
@@ -88,28 +90,14 @@ and restart the portal:
 systemctl --user restart xdg-desktop-portal.service
 ```
 
-### Rootless testing
+### Do not use XDG_DESKTOP_PORTAL_DIR to test this
 
-`XDG_DESKTOP_PORTAL_DIR` overrides where xdg-desktop-portal looks for `.portal`
-files, which avoids touching `/usr` while iterating. It *replaces* the search path
-rather than adding to it, so symlink the system backends in alongside this one or
-file dialogs and screen sharing will stop working:
-
-```sh
-D=~/.local/share/niri-input-portal-test/portals
-mkdir -p $D
-ln -sf /usr/share/xdg-desktop-portal/portals/*.portal $D/
-cp data/niri-input.portal $D/
-systemctl --user set-environment XDG_DESKTOP_PORTAL_DIR=$D
-systemctl --user restart xdg-desktop-portal.service
-```
-
-Revert with:
-
-```sh
-systemctl --user unset-environment XDG_DESKTOP_PORTAL_DIR
-systemctl --user restart xdg-desktop-portal.service
-```
+It looks like a convenient way to register the backend without root, but setting
+it makes xdg-desktop-portal **skip `portals.conf` entirely**. Every interface
+routed through that file falls back to `UseIn` matching, and since `gnome.portal`
+declares `UseIn=gnome` while niri sets `XDG_CURRENT_DESKTOP=niri`, ScreenCast and
+Screenshot silently lose their backend — screen sharing and screenshots break.
+Install to `/usr/share` instead.
 
 ## Verifying
 
