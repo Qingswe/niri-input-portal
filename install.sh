@@ -32,19 +32,27 @@ sudo install -Dm644 data/org.freedesktop.impl.portal.desktop.niri-input.service 
 install -Dm644 data/niri-input-portal.service "$UNIT_DIR/niri-input-portal.service"
 systemctl --user daemon-reload
 
-echo "==> Routing InputCapture to this backend in $CONF"
+echo "==> Routing InputCapture and Clipboard to this backend in $CONF"
 mkdir -p "$CONF_DIR"
 if [ ! -f "$CONF" ]; then
     printf '[preferred]\ndefault=gnome;gtk;\n' > "$CONF"
     echo "    created $CONF"
 fi
-if grep -q '^org\.freedesktop\.impl\.portal\.InputCapture=' "$CONF"; then
-    sed -i 's|^org\.freedesktop\.impl\.portal\.InputCapture=.*|org.freedesktop.impl.portal.InputCapture=niri-input;|' "$CONF"
-    echo "    updated the existing InputCapture line"
-else
-    printf 'org.freedesktop.impl.portal.InputCapture=niri-input;\n' >> "$CONF"
-    echo "    added the InputCapture line"
-fi
+
+# Clipboard has to be routed here too, and it is not optional. The clipboard
+# portal attaches to a session another portal created, so if it lands on a
+# different backend that backend is asked about a session it has never heard of.
+# RequestClipboard then fails, and Synergy responds by discarding the session and
+# opening a new one -- a create/destroy loop that never gets as far as capturing.
+for iface in InputCapture Clipboard; do
+    if grep -q "^org\.freedesktop\.impl\.portal\.$iface=" "$CONF"; then
+        sed -i "s|^org\.freedesktop\.impl\.portal\.$iface=.*|org.freedesktop.impl.portal.$iface=niri-input;|" "$CONF"
+        echo "    updated the existing $iface line"
+    else
+        printf 'org.freedesktop.impl.portal.%s=niri-input;\n' "$iface" >> "$CONF"
+        echo "    added the $iface line"
+    fi
+done
 
 echo "==> Restarting xdg-desktop-portal"
 systemctl --user restart xdg-desktop-portal.service

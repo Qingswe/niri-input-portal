@@ -56,6 +56,12 @@ Three pieces have to line up, and as of xdg-desktop-portal 1.21.1 they finally d
 | xdg-desktop-portal lets an InputCapture session ask | **1.21.1 and later** |
 | This backend answers | done |
 
+Confirmed working on xdg-desktop-portal 1.22.1 and niri 26.04: the frontend gained
+`input_capture_session_can_request_clipboard`, `Start` now reports
+`clipboard_enabled=true`, and `SelectionOwnerChanged` reaches the client with the
+selection's mime types. Synergy reads the selection **on activation** — when the
+pointer crosses to the other machine — not when the clipboard changes.
+
 Before 1.21.1 the frontend gated clipboard access on the session being a
 *RemoteDesktop* session — its only check was
 `remote_desktop_session_can_request_clipboard` — so Synergy's request came back
@@ -78,7 +84,25 @@ The selection is reached with `ext_data_control_manager_v1` rather than
 when this process has no focus at all — the point is to hand the clipboard to a
 machine that is not this one. niri advertises it.
 
-Checking it without a portal client:
+### Clipboard must be routed to this backend too
+
+`portals.conf` needs both lines, not just InputCapture:
+
+```ini
+org.freedesktop.impl.portal.InputCapture=niri-input;
+org.freedesktop.impl.portal.Clipboard=niri-input;
+```
+
+`install.sh` writes both. Routing only InputCapture looks like it should work and
+does not: the clipboard portal attaches to a session another portal created, so
+if `Clipboard` falls through to `default=gnome;gtk;` then xdg-desktop-portal asks
+xdg-desktop-portal-gnome about a session it has never heard of.
+`RequestClipboard` fails, and Synergy reacts by discarding the session and opening
+a fresh one — a create/destroy loop that never gets as far as capturing. It shows
+up as thousands of sessions in `--status` and, in the log, `session started …
+clipboard_enabled=false` repeating every few milliseconds.
+
+### Checking it without a portal client
 
 ```sh
 wl-copy hello
@@ -183,9 +207,8 @@ capture enabled                barriers=2
 `synergy-core` now reaches `connection state: Listening` and stays up, instead of
 exiting after 0.13s in a restart loop.
 
-Installed and verified on niri 25.11, xdg-desktop-portal 1.20.4, libei 1.5.0.
-The clipboard path was verified by driving the impl interface directly, since
-1.20.4 will not route it; capture is unaffected either way.
+Installed and verified on niri 25.11 / 26.04, xdg-desktop-portal 1.20.4 / 1.22.1,
+libei 1.5.0 / 1.6.0.
 
 ## Build
 

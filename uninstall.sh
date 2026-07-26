@@ -23,8 +23,9 @@ rm -rf "$UNIT_DIR/niri-input-portal.service.d"
 systemctl --user daemon-reload
 
 if [ -f "$CONF" ]; then
-    echo "==> Dropping the InputCapture line from $CONF"
+    echo "==> Dropping the InputCapture and Clipboard lines from $CONF"
     sed -i '/^org\.freedesktop\.impl\.portal\.InputCapture=niri-input;$/d' "$CONF"
+    sed -i '/^org\.freedesktop\.impl\.portal\.Clipboard=niri-input;$/d' "$CONF"
 fi
 
 echo "==> Restarting xdg-desktop-portal"
