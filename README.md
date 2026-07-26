@@ -17,6 +17,10 @@ libportal's `inputcapture*.c` and links `libei.so.1`. The chain breaks below it:
 | `org.freedesktop.impl.portal.InputCapture` (backend) | **missing** |
 | `org.gnome.Mutter.InputCapture` | **not provided by niri** |
 
+The same holds for the clipboard: `synergy-core` contains `PortalInputCapture.cpp`
+code that reads the selection on activation, but with no backend there is no
+session for it to read through.
+
 `xdg-desktop-portal-gnome` implements the InputCapture backend on top of
 `org.gnome.Mutter.InputCapture`. niri exposes `Mutter.ScreenCast`, `Mutter.DisplayConfig`,
 `Mutter.ServiceChannel`, `Shell.Introspect` and `Shell.Screenshot` — but not
@@ -39,6 +43,58 @@ does support (`wlr-layer-shell`, `pointer-constraints`, `relative-pointer`).
 | 3 | Forward relative motion, keys, scroll | **done, verified** against a real remote screen |
 | 4 | `Release` + restore the local cursor | **done, verified** |
 | 5 | Multi-output, scale, transform, hotplug | partial (zones and barrier placement are correct) |
+| — | Clipboard sharing | **done**, needs xdg-desktop-portal ≥ 1.21.1 |
+
+## Clipboard
+
+Clipboard sharing is not something an InputCapture backend can add on its own.
+Three pieces have to line up, and as of xdg-desktop-portal 1.21.1 they finally do:
+
+| Piece | State |
+|---|---|
+| Synergy asks for the clipboard on its InputCapture session | already shipping |
+| xdg-desktop-portal lets an InputCapture session ask | **1.21.1 and later** |
+| This backend answers | done |
+
+Before 1.21.1 the frontend gated clipboard access on the session being a
+*RemoteDesktop* session — its only check was
+`remote_desktop_session_can_request_clipboard` — so Synergy's request came back
+as `Invalid session type` and it logged `clipboard not enabled on session`.
+
+The capability is reached through version 2 of the InputCapture interface:
+`CreateSession2` makes a session that is not yet started, `RequestClipboard` goes
+in the gap, and `Start` reports back `clipboard_enabled`. This backend implements
+both versions, so an older frontend keeps using `CreateSession` and simply gets no
+clipboard.
+
+Content moves as file descriptors and is never copied through this process. On a
+read, the client is handed the read end of a pipe the selection owner writes into.
+On a write, the compositor's own pipe is parked against a serial, announced as
+`SelectionTransfer`, and passed to the client verbatim when it answers with
+`SelectionWrite`.
+
+The selection is reached with `ext_data_control_manager_v1` rather than
+`wl_data_device`, because the clipboard has to be readable and writable at moments
+when this process has no focus at all — the point is to hand the clipboard to a
+machine that is not this one. niri advertises it.
+
+Checking it without a portal client:
+
+```sh
+wl-copy hello
+niri-input-portal --clip-status        # should list text/plain
+niri-input-portal --clip-read          # should print hello
+```
+
+Known limits:
+
+- Claiming the selection discards whatever was on it, exactly as a local copy
+  would, and releasing it does not put the old content back.
+- Unanswered reads are capped at 16. Local applications poll the clipboard
+  constantly, so a claim with nothing behind it would otherwise accumulate open
+  pipes until the process ran out of file descriptors. The oldest is dropped,
+  which its reader sees as an empty clipboard.
+- The primary selection (middle-click paste) is deliberately not shared.
 
 ## How capture works
 
@@ -92,6 +148,10 @@ The escapes that do work, in order of convenience:
    niri-input-portal --status    # what does it think is going on
    ```
 
+   There are matching clipboard commands — `--clip-status`, `--clip-read
+   [mime-type]`, `--clip-claim [mime-type...]` — but those are for diagnosis, not
+   escape.
+
 3. **Kill the process.** `pkill -f niri-input-portal` always works: the
    compositor destroys the surface and with it the pointer lock as soon as the
    client disconnects.
@@ -124,6 +184,8 @@ capture enabled                barriers=2
 exiting after 0.13s in a restart loop.
 
 Installed and verified on niri 25.11, xdg-desktop-portal 1.20.4, libei 1.5.0.
+The clipboard path was verified by driving the impl interface directly, since
+1.20.4 will not route it; capture is unaffected either way.
 
 ## Build
 
@@ -221,6 +283,8 @@ outer pixel: detection is unchanged, but the release has room to place the curso
 - Output scale and transform are read but not applied to motion deltas; on a
   fractionally scaled output the remote pointer speed will not match the local
   one exactly.
+- Session persistence is not offered: `Start` never returns `restore_data`, so a
+  client asking for `persist_mode` gets a fresh session every time.
 - Rearming while the pointer already rests on a barrier captures immediately.
   The release inset makes this unlikely in normal use, but restarting the service
   with the cursor parked against an edge can still trigger it.

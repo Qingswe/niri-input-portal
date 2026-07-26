@@ -5,6 +5,7 @@
 //! signals. That is why this implements the `impl.portal` interface rather than
 //! standing up a second `org.freedesktop.portal.Desktop`.
 
+use anyhow::Context as _;
 use crate::{
     eis_server::{self, EisHandle},
     niri,
@@ -85,6 +86,10 @@ pub struct Session {
     pub zones: Vec<niri::OutputZone>,
     pub barriers: Vec<Barrier>,
     pub eis: Option<EisHandle>,
+    /// False between `CreateSession2` and `Start`. The deprecated `CreateSession`
+    /// produces a session that is started from the outset, which is the whole
+    /// difference between the two.
+    pub started: bool,
     pub enabled: bool,
     /// Non-zero while a capture run is in flight.
     pub activation_id: u32,
@@ -266,6 +271,65 @@ impl InputCapture {
     pub fn new(state: State) -> Self {
         Self { state }
     }
+
+    /// Register a session and export its impl-side Session object.
+    ///
+    /// Shared by both entry points; they differ only in whether the session
+    /// arrives already started and with capabilities settled.
+    async fn create(
+        &self,
+        session_handle: &OwnedObjectPath,
+        app_id: &str,
+        capabilities: u32,
+        started: bool,
+        object_server: &zbus::ObjectServer,
+    ) -> Result<(), anyhow::Error> {
+        let zones = niri::outputs()
+            .await
+            .context("cannot enumerate niri outputs")?;
+        let zone_set = self.state.next_zone_set.fetch_add(1, Ordering::Relaxed);
+
+        let session = Session {
+            handle: session_handle.clone(),
+            app_id: app_id.to_owned(),
+            capabilities,
+            zone_set,
+            zones,
+            barriers: Vec::new(),
+            eis: None,
+            started,
+            enabled: false,
+            clipboard_requested: false,
+            activation_id: 0,
+        };
+
+        self.state
+            .sessions
+            .lock()
+            .await
+            .insert(session_handle.clone(), session);
+
+        // The backend owns the impl-side Session object.
+        let closable = SessionObject {
+            state: self.state.clone(),
+            handle: session_handle.clone(),
+        };
+        if let Err(err) = object_server.at(session_handle, closable).await {
+            self.state.sessions.lock().await.remove(session_handle);
+            return Err(anyhow::anyhow!("failed to export session object: {err}"));
+        }
+
+        info!(%app_id, session = %session_handle.as_str(), capabilities, started, "session created");
+        Ok(())
+    }
+}
+
+/// The capability bitmask a client asked for, or zero if it asked for nothing.
+fn requested_capabilities(options: &HashMap<String, OwnedValue>) -> u32 {
+    options
+        .get("capabilities")
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0)
 }
 
 #[interface(name = "org.freedesktop.impl.portal.InputCapture")]
@@ -278,11 +342,18 @@ impl InputCapture {
     }
 
     // Spelled lowercase in the spec, unlike every other member.
+    //
+    // Version 2 is what makes clipboard sharing reachable: xdg-desktop-portal
+    // only offers the Clipboard interface to an InputCapture session from 1.21.1
+    // onwards, and only through the v2 handshake. A 1.20 frontend ignores the
+    // v2 members and keeps using CreateSession, so this stays backwards
+    // compatible.
     #[zbus(property, name = "version")]
     fn version(&self) -> u32 {
-        1
+        2
     }
 
+    /// The deprecated v1 entry point. The session it makes is already started.
     async fn create_session(
         &self,
         _handle: OwnedObjectPath,
@@ -292,63 +363,91 @@ impl InputCapture {
         options: HashMap<String, OwnedValue>,
         #[zbus(object_server)] object_server: &zbus::ObjectServer,
     ) -> (u32, Results) {
-        let requested: u32 = options
-            .get("capabilities")
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(0);
-
-        // Always a subset of what was asked for, and of what we implement.
+        let requested = requested_capabilities(&options);
         let granted = requested & (CAP_KEYBOARD | CAP_POINTER);
         if granted == 0 {
             warn!(%app_id, requested, "rejecting session: no supported capabilities");
             return (RESPONSE_OTHER, Results::new());
         }
 
-        let zones = match niri::outputs().await {
-            Ok(z) => z,
-            Err(err) => {
-                error!(%app_id, "cannot enumerate niri outputs: {err:#}");
-                return (RESPONSE_OTHER, Results::new());
-            }
-        };
-
-        let zone_set = self.state.next_zone_set.fetch_add(1, Ordering::Relaxed);
-        let session_id = session_handle.as_str().to_owned();
-
-        let session = Session {
-            handle: session_handle.clone(),
-            app_id: app_id.clone(),
-            capabilities: granted,
-            zone_set,
-            zones,
-            barriers: Vec::new(),
-            eis: None,
-            enabled: false,
-            clipboard_requested: false,
-            activation_id: 0,
-        };
-
+        if let Err(err) = self
+            .create(&session_handle, &app_id, granted, true, object_server)
+            .await
         {
-            let mut sessions = self.state.sessions.lock().await;
-            sessions.insert(session_handle.clone(), session);
-        }
-
-        // The backend owns the impl-side Session object.
-        let closable = SessionObject {
-            state: self.state.clone(),
-            handle: session_handle.clone(),
-        };
-        if let Err(err) = object_server.at(&session_handle, closable).await {
-            error!(%app_id, "failed to export session object: {err}");
-            self.state.sessions.lock().await.remove(&session_handle);
+            error!(%app_id, "CreateSession failed: {err:#}");
             return (RESPONSE_OTHER, Results::new());
         }
 
-        info!(%app_id, session = %session_handle.as_str(), capabilities = granted, "session created");
+        let mut results = Results::new();
+        insert(&mut results, "session_id", Value::from(session_handle.as_str().to_owned()));
+        insert(&mut results, "capabilities", Value::from(granted));
+        (RESPONSE_SUCCESS, results)
+    }
+
+    /// The v2 entry point: creates the session without starting it.
+    ///
+    /// Capabilities are not negotiated here — that moves to `Start`, which is
+    /// what gives `RequestClipboard` somewhere to sit in between.
+    #[zbus(name = "CreateSession2")]
+    async fn create_session2(
+        &self,
+        session_handle: OwnedObjectPath,
+        app_id: String,
+        _options: HashMap<String, OwnedValue>,
+        #[zbus(object_server)] object_server: &zbus::ObjectServer,
+    ) -> zbus::fdo::Result<Results> {
+        // No response code on this method, so a failure has to be a D-Bus error.
+        self.create(&session_handle, &app_id, 0, false, object_server)
+            .await
+            .map_err(|err| zbus::fdo::Error::Failed(format!("{err:#}")))?;
+        Ok(Results::new())
+    }
+
+    /// Negotiate capabilities and start a session made by `CreateSession2`.
+    async fn start(
+        &self,
+        _handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
+        app_id: String,
+        _parent_window: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> (u32, Results) {
+        let requested = requested_capabilities(&options);
+        let granted = requested & (CAP_KEYBOARD | CAP_POINTER);
+        if granted == 0 {
+            warn!(%app_id, requested, "rejecting Start: no supported capabilities");
+            return (RESPONSE_OTHER, Results::new());
+        }
+
+        let clipboard_enabled = {
+            let mut sessions = self.state.sessions.lock().await;
+            let Some(session) = sessions.get_mut(&session_handle) else {
+                warn!(%app_id, session = %session_handle, "Start for an unknown session");
+                return (RESPONSE_OTHER, Results::new());
+            };
+            if session.started {
+                warn!(%app_id, session = %session_handle, "Start called twice");
+                return (RESPONSE_OTHER, Results::new());
+            }
+            session.capabilities = granted;
+            session.started = true;
+            session.clipboard_requested
+        };
+
+        info!(
+            %app_id,
+            session = %session_handle.as_str(),
+            capabilities = granted,
+            clipboard_enabled,
+            "session started"
+        );
 
         let mut results = Results::new();
-        insert(&mut results, "session_id", Value::from(session_id));
         insert(&mut results, "capabilities", Value::from(granted));
+        // Persistence is deliberately not offered: `restore_data` is omitted, so
+        // a client asking for persist_mode gets a fresh prompt-free session each
+        // time rather than a token that would restore nothing.
+        insert(&mut results, "clipboard_enabled", Value::from(clipboard_enabled));
         (RESPONSE_SUCCESS, results)
     }
 
@@ -500,6 +599,13 @@ impl InputCapture {
         let Some(session) = sessions.get_mut(&session_handle) else {
             return (RESPONSE_OTHER, Results::new());
         };
+        if !session.started {
+            // A v2 session has no negotiated capabilities until Start, so arming
+            // barriers now would capture on behalf of a session that was never
+            // granted anything.
+            warn!(%app_id, "Enable called before Start");
+            return (RESPONSE_OTHER, Results::new());
+        }
         if session.eis.is_none() {
             warn!(%app_id, "Enable called before ConnectToEIS");
             return (RESPONSE_OTHER, Results::new());
