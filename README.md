@@ -36,8 +36,8 @@ does support (`wlr-layer-shell`, `pointer-constraints`, `relative-pointer`).
 |---|---|---|
 | 1 | Portal session + client reaches EIS | **done, verified** |
 | 2 | Pointer barriers, emit `Activated` | **done, verified** |
-| 3 | Forward relative motion, keys, scroll | **done**, not yet verified against a remote screen |
-| 4 | `Release` + restore the local cursor | partial — see below |
+| 3 | Forward relative motion, keys, scroll | **done, verified** against a real remote screen |
+| 4 | `Release` + restore the local cursor | **done, verified** |
 | 5 | Multi-output, scale, transform, hotplug | partial (zones and barrier placement are correct) |
 
 ## How capture works
@@ -138,25 +138,35 @@ cargo build --release
 ## Install
 
 ```sh
-sudo install -Dm755 target/release/niri-input-portal /usr/lib/niri-input-portal
-sudo install -Dm644 data/niri-input.portal /usr/share/xdg-desktop-portal/portals/niri-input.portal
-sudo install -Dm644 data/org.freedesktop.impl.portal.desktop.niri-input.service \
-    /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.niri-input.service
-install -Dm644 data/niri-input-portal.service ~/.config/systemd/user/niri-input-portal.service
-systemctl --user daemon-reload
+./install.sh
 ```
 
-Then route the interface to this backend in `~/.config/xdg-desktop-portal/niri-portals.conf`:
+It builds, installs, wires up the portal routing and checks the result. Rerun it
+after a `git pull` to upgrade. `./uninstall.sh` reverses everything.
 
-```ini
-org.freedesktop.impl.portal.InputCapture=niri-input;
-```
+Read the script's closing note: it asks you to add one keybinding to your niri
+config by hand, and that binding is the only reliable way out of a stuck
+capture. See [Getting unstuck](#getting-unstuck).
 
-and restart the portal:
+### Does it survive a reboot?
 
-```sh
-systemctl --user restart xdg-desktop-portal.service
-```
+Yes, and nothing needs enabling. The service is D-Bus activated rather than
+started at login: xdg-desktop-portal asks for
+`org.freedesktop.impl.portal.desktop.niri-input` the first time a client wants
+input capture, and systemd starts it then. It is not resident when unused.
+
+The unit carries `ConditionEnvironment=WAYLAND_DISPLAY`, which holds because
+`niri-session` runs `dbus-update-activation-environment --all` on every login.
+
+### What install.sh touches
+
+| Path | Purpose |
+|---|---|
+| `/usr/lib/niri-input-portal` | the binary |
+| `/usr/share/xdg-desktop-portal/portals/niri-input.portal` | declares the backend |
+| `/usr/share/dbus-1/services/…niri-input.service` | D-Bus activation |
+| `~/.config/systemd/user/niri-input-portal.service` | the unit activation starts |
+| `~/.config/xdg-desktop-portal/<desktop>-portals.conf` | routes InputCapture here |
 
 ### Do not use XDG_DESKTOP_PORTAL_DIR to test this
 
@@ -188,20 +198,33 @@ busctl --user call org.freedesktop.impl.portal.desktop.niri-input \
 
 Set `NIRI_INPUT_PORTAL_LOG=debug` for per-call tracing.
 
+## Returning the cursor
+
+Synergy 3.7 sends a constant `cursor_position` of `(1.0, 0.0)` on every
+`Release`, so honouring it verbatim pinned the cursor to the same corner every
+time. The hint is now used only when it actually lands on the barrier surface it
+claims to be about; otherwise the cursor returns to where it crossed, which is
+what it looks like it should do anyway.
+
+That needs somewhere to put it. `set_cursor_position_hint` is surface-local, so a
+one-pixel barrier could only slide the cursor *along* the edge. Barrier surfaces
+are therefore `BARRIER_DEPTH` (64px) deep while their input region stays a single
+outer pixel: detection is unchanged, but the release has room to place the cursor
+`RELEASE_INSET` (8px) inside the screen, clear of the strip it just came through.
+
 ## Known gaps
 
-- `Release`'s `cursor_position` hint is passed to `set_cursor_position_hint`, but
-  the barrier surface is one pixel wide, so the hint can only move the cursor
-  *along* the edge rather than back into the screen. Returning from a remote
-  screen therefore leaves the cursor pinned at the edge. Doing this properly
-  needs a wider surface that is grown for the release.
 - `org.freedesktop.impl.portal.Request` objects are not exported, so in-flight
   calls cannot be cancelled. Harmless today because every handler returns
   immediately.
 - niri's own compositor keybindings (`Mod`+…) are consumed before any client sees
-  them, so those combinations cannot be forwarded to a remote screen.
+  them, so those combinations cannot be forwarded to a remote screen. This is the
+  same mechanism the escape binding relies on.
 - Barrier surfaces occupy the outermost pixel column or row of an output while
   armed, so a click landing exactly there is swallowed.
 - Output scale and transform are read but not applied to motion deltas; on a
   fractionally scaled output the remote pointer speed will not match the local
   one exactly.
+- Rearming while the pointer already rests on a barrier captures immediately.
+  The release inset makes this unlikely in normal use, but restarting the service
+  with the cursor parked against an edge can still trigger it.

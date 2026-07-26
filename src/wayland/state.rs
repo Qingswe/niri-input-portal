@@ -4,7 +4,7 @@ use super::{place, Edge, PlacedBarrier, WaylandCmd, WaylandEvent};
 use crate::eis_server::{EisCommand, EisHandle, SharedKeymap};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -39,13 +39,17 @@ use wayland_protocols::wp::{
     relative_pointer::zv1::client::zwp_relative_pointer_v1,
 };
 
-/// Wayland keycodes are evdev codes offset by 8; EIS wants the evdev value.
-const EVDEV_OFFSET: u32 = 8;
+// `KeyEvent::raw_code` is already the evdev keycode: it is the raw `wl_keyboard.key`
+// wire value, which the Wayland protocol defines as the Linux evdev code, and sctk
+// itself adds 8 to it wherever it needs an xkb keycode. EIS also takes evdev codes,
+// so the value is passed through untouched — subtracting 8 here shifted every key
+// by eight positions, turning A into U.
 
 struct BarrierSurface {
     id: u32,
     layer: LayerSurface,
     origin: (i32, i32),
+    placed: PlacedBarrier,
     buffer: Option<wl_buffer::WlBuffer>,
     drawn: bool,
 }
@@ -60,6 +64,11 @@ struct Capture {
     eis: Option<EisHandle>,
     /// Events observed before the EIS handle arrived.
     pending: Vec<EisCommand>,
+    placed: PlacedBarrier,
+    /// Where the pointer sat on the barrier when capture began, surface-local.
+    /// This is the honest answer to "where should the cursor come back", and it
+    /// is used whenever the client's own suggestion is unusable.
+    entry_along: f64,
     /// Counted per kind so a capture that produced nothing is distinguishable
     /// from one that was never wired up.
     motions: u32,
@@ -179,15 +188,40 @@ impl AppState {
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.set_margin(p.margin.0, 0, 0, p.margin.1);
+        // The surface is BARRIER_DEPTH deep so the cursor can be put back inside
+        // the screen on release, but only its outer pixel may take input —
+        // otherwise it would swallow clicks well inside the display.
+        self.set_input_strip(layer.wl_surface(), Some(p.input_strip()));
         layer.commit();
 
         Some(BarrierSurface {
             id: p.id,
             layer,
             origin: p.origin,
+            placed: p.clone(),
             buffer: None,
             drawn: false,
         })
+    }
+
+    /// Restrict a surface's input region, or pass `None` for the whole surface.
+    fn set_input_strip(
+        &self,
+        surface: &wl_surface::WlSurface,
+        strip: Option<(i32, i32, i32, i32)>,
+    ) {
+        match strip {
+            Some((x, y, w, h)) => match Region::new(&self.compositor) {
+                Ok(region) => {
+                    region.add(x, y, w, h);
+                    surface.set_input_region(Some(region.wl_region()));
+                    // Region is destroyed on drop; the compositor keeps its own
+                    // copy of the region once it has been set.
+                }
+                Err(err) => warn!("could not create an input region: {err}"),
+            },
+            None => surface.set_input_region(None),
+        }
     }
 
     /// Attach a fully transparent buffer so the surface maps and can take input.
@@ -229,7 +263,15 @@ impl AppState {
 
         let s = &self.surfaces[index];
         let (barrier_id, origin, layer) = (s.id, s.origin, s.layer.clone());
+        let placed = s.placed.clone();
         let surface = layer.wl_surface().clone();
+
+        // Position along the edge that the pointer crossed at, in surface-local
+        // coordinates — the axis depends on whether the edge is vertical.
+        let entry_along = match placed.edge {
+            Edge::Left | Edge::Right => position.1 - f64::from(origin.1),
+            Edge::Top | Edge::Bottom => position.0 - f64::from(origin.0),
+        };
 
         let lock = match self.pointer_constraints.lock_pointer(
             &surface,
@@ -248,6 +290,9 @@ impl AppState {
         // Exclusive keyboard focus is what lets keystrokes reach the remote
         // screen instead of whatever window happens to be focused locally.
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        // Widen the input region to the whole surface for the duration of the
+        // capture; the pointer is locked anyway and this keeps focus stable.
+        self.set_input_strip(&surface, None);
         layer.commit();
 
         // A locked pointer still draws a cursor; hide it so the screen looks
@@ -262,6 +307,8 @@ impl AppState {
             origin,
             eis: None,
             pending: Vec::new(),
+            placed,
+            entry_along,
             motions: 0,
             keys: 0,
             buttons: 0,
@@ -296,21 +343,30 @@ impl AppState {
             return;
         };
 
-        if let Some((x, y)) = cursor_hint {
-            // The hint is surface-local, and the surface is one pixel wide, so
-            // this can only nudge the cursor along the barrier rather than back
-            // into the screen. Better than nothing; a wider release surface
-            // would be needed to do this properly.
-            let local = (
-                x - f64::from(capture.origin.0),
-                y - f64::from(capture.origin.1),
-            );
-            capture.lock.set_cursor_position_hint(local.0, local.1);
-            capture.layer.wl_surface().commit();
-        }
+        // Where along the edge to come back. The client's suggestion is only
+        // used when it is actually usable: Synergy 3.7 sends a constant (1, 0)
+        // on every Release, which would pin the cursor to the same corner for
+        // ever. Falling back to the crossing point is what users expect anyway —
+        // the cursor reappears where it left.
+        let along = match cursor_hint.and_then(|h| self.usable_hint(&capture, h)) {
+            Some(along) => along,
+            None => capture.entry_along,
+        };
+
+        let (hx, hy) = capture.placed.release_hint(along);
+        capture.lock.set_cursor_position_hint(hx, hy);
+        // The hint only takes effect when the lock is destroyed, and only if it
+        // has been committed first.
+        capture.layer.wl_surface().commit();
 
         capture.lock.destroy();
         capture.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        // Shrink the input region back to the outer strip so the rest of the
+        // surface stops swallowing clicks.
+        self.set_input_strip(
+            capture.layer.wl_surface(),
+            Some(capture.placed.input_strip()),
+        );
         capture.layer.commit();
 
         if let Some(pointer) = &self.pointer {
@@ -325,6 +381,34 @@ impl AppState {
             scrolls = capture.scrolls,
             "capture ended, pointer released"
         );
+    }
+
+    /// Decide whether a client's `cursor_position` is worth honouring.
+    ///
+    /// Returns the position along the barrier's edge if the hint lands on this
+    /// barrier's surface, `None` if it is nonsense and the entry point should be
+    /// used instead.
+    fn usable_hint(&self, capture: &Capture, hint: (f64, f64)) -> Option<f64> {
+        let (ox, oy) = (
+            f64::from(capture.origin.0),
+            f64::from(capture.origin.1),
+        );
+        let (w, h) = (
+            f64::from(capture.placed.size.0),
+            f64::from(capture.placed.size.1),
+        );
+        let (lx, ly) = (hint.0 - ox, hint.1 - oy);
+
+        // A hint that does not even fall within the barrier surface is telling
+        // us nothing about where along this edge the pointer should land.
+        if lx < 0.0 || ly < 0.0 || lx > w || ly > h {
+            debug!(?hint, "ignoring an out-of-range cursor hint from the client");
+            return None;
+        }
+        Some(match capture.placed.edge {
+            Edge::Left | Edge::Right => ly,
+            Edge::Top | Edge::Bottom => lx,
+        })
     }
 
     /// Route one event to the client, buffering if EIS is not attached yet.
@@ -750,7 +834,7 @@ impl KeyboardHandler for AppState {
             return;
         }
         self.forward(EisCommand::Key {
-            keycode: event.raw_code.saturating_sub(EVDEV_OFFSET),
+            keycode: event.raw_code,
             press: true,
         });
         self.forward_frame();
@@ -781,7 +865,7 @@ impl KeyboardHandler for AppState {
             return;
         }
         self.forward(EisCommand::Key {
-            keycode: event.raw_code.saturating_sub(EVDEV_OFFSET),
+            keycode: event.raw_code,
             press: false,
         });
         self.forward_frame();

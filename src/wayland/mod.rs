@@ -25,6 +25,21 @@ pub enum Edge {
     Bottom,
 }
 
+/// How deep the barrier surface reaches into the output, in logical pixels.
+///
+/// Detection only ever uses the outermost pixel — the input region is a single
+/// row or column — but `zwp_locked_pointer_v1::set_cursor_position_hint` takes
+/// surface-local coordinates, so a one-pixel surface can only slide the cursor
+/// *along* the edge. The extra depth is what makes it possible to put the
+/// cursor back inside the screen when a capture ends.
+pub const BARRIER_DEPTH: u32 = 64;
+
+/// How far inside the edge the cursor is placed on release.
+///
+/// Far enough that it is clear of the input region and cannot immediately
+/// retrigger the barrier it just came back through.
+pub const RELEASE_INSET: f64 = 8.0;
+
 /// A barrier resolved against the current output layout.
 #[derive(Debug, Clone)]
 pub struct PlacedBarrier {
@@ -32,13 +47,39 @@ pub struct PlacedBarrier {
     pub edge: Edge,
     /// Name of the output this edge belongs to.
     pub output: String,
-    /// Surface size in logical pixels.
+    /// Surface size in logical pixels, including [`BARRIER_DEPTH`].
     pub size: (u32, u32),
     /// Distance from the anchored corner, in logical pixels.
     pub margin: (i32, i32),
     /// Global logical position of the surface's top-left corner, used to turn
     /// surface-local pointer coordinates back into portal coordinates.
     pub origin: (i32, i32),
+}
+
+impl PlacedBarrier {
+    /// The input region, in surface-local coordinates: the one-pixel strip on
+    /// the outer edge. Everything else in the surface stays click-through.
+    pub fn input_strip(&self) -> (i32, i32, i32, i32) {
+        let (w, h) = (self.size.0 as i32, self.size.1 as i32);
+        match self.edge {
+            Edge::Left => (0, 0, 1, h),
+            Edge::Right => (w - 1, 0, 1, h),
+            Edge::Top => (0, 0, w, 1),
+            Edge::Bottom => (0, h - 1, w, 1),
+        }
+    }
+
+    /// Where to leave the cursor when a capture on this barrier ends, in
+    /// surface-local coordinates. `along` is the position on the edge axis.
+    pub fn release_hint(&self, along: f64) -> (f64, f64) {
+        let (w, h) = (f64::from(self.size.0), f64::from(self.size.1));
+        match self.edge {
+            Edge::Left => (RELEASE_INSET, along.clamp(0.0, h - 1.0)),
+            Edge::Right => (w - 1.0 - RELEASE_INSET, along.clamp(0.0, h - 1.0)),
+            Edge::Top => (along.clamp(0.0, w - 1.0), RELEASE_INSET),
+            Edge::Bottom => (along.clamp(0.0, w - 1.0), h - 1.0 - RELEASE_INSET),
+        }
+    }
 }
 
 /// Commands sent to the Wayland thread.
@@ -195,12 +236,19 @@ fn place_one(
                 continue;
             };
             let height = u32::try_from(bottom - top).ok()?;
-            let origin_x = if edge == Edge::Right { ox + ow - 1 } else { ox };
+            // The surface reaches inward from the edge, so a right-anchored one
+            // starts BARRIER_DEPTH short of the output's right side.
+            let depth = i32::try_from(BARRIER_DEPTH).ok()?;
+            let origin_x = if edge == Edge::Right {
+                ox + ow - depth
+            } else {
+                ox
+            };
             return Some(PlacedBarrier {
                 id: b.id,
                 edge,
                 output: name.clone(),
-                size: (1, height),
+                size: (BARRIER_DEPTH, height),
                 margin: (top - oy, 0),
                 origin: (origin_x, top),
             });
@@ -220,12 +268,17 @@ fn place_one(
                 continue;
             };
             let width = u32::try_from(right - left).ok()?;
-            let origin_y = if edge == Edge::Bottom { oy + oh - 1 } else { oy };
+            let depth = i32::try_from(BARRIER_DEPTH).ok()?;
+            let origin_y = if edge == Edge::Bottom {
+                oy + oh - depth
+            } else {
+                oy
+            };
             return Some(PlacedBarrier {
                 id: b.id,
                 edge,
                 output: name.clone(),
-                size: (width, 1),
+                size: (width, BARRIER_DEPTH),
                 margin: (0, left - ox),
                 origin: (left, origin_y),
             });
@@ -256,8 +309,9 @@ mod tests {
         let p = &placed[0];
         assert_eq!(p.edge, Edge::Right);
         assert_eq!(p.output, "HDMI-A-1");
-        assert_eq!(p.size, (1, 1728));
-        assert_eq!(p.origin, (3071, 0));
+        assert_eq!(p.size, (BARRIER_DEPTH, 1728));
+        // The surface reaches inward, so it starts BARRIER_DEPTH short of 3072.
+        assert_eq!(p.origin, (3072 - BARRIER_DEPTH as i32, 0));
     }
 
     #[test]
@@ -276,8 +330,44 @@ mod tests {
         // though the output is shorter.
         let b = Barrier { id: 3, x1: 3072, y1: -500, x2: 3072, y2: 9000 };
         let (placed, _) = place(&[b], &outputs());
-        assert_eq!(placed[0].size, (1, 1728));
+        assert_eq!(placed[0].size, (BARRIER_DEPTH, 1728));
         assert_eq!(placed[0].margin, (0, 0));
+    }
+
+    #[test]
+    fn input_strip_hugs_the_outer_edge_only() {
+        let right = Barrier { id: 1, x1: 3072, y1: 0, x2: 3072, y2: 1728 };
+        let (placed, _) = place(&[right], &outputs());
+        // Rightmost column of the surface, one pixel wide, full height.
+        assert_eq!(placed[0].input_strip(), (BARRIER_DEPTH as i32 - 1, 0, 1, 1728));
+
+        let left = Barrier { id: 2, x1: 298, y1: 1728, x2: 298, y2: 2794 };
+        let (placed, _) = place(&[left], &outputs());
+        assert_eq!(placed[0].input_strip(), (0, 0, 1, 1066));
+    }
+
+    #[test]
+    fn release_hint_lands_inside_the_screen_clear_of_the_strip() {
+        let right = Barrier { id: 1, x1: 3072, y1: 0, x2: 3072, y2: 1728 };
+        let (placed, _) = place(&[right], &outputs());
+        let p = &placed[0];
+        let (x, y) = p.release_hint(900.0);
+
+        // Inward of the input strip, so returning cannot immediately retrigger.
+        let strip_x = f64::from(p.input_strip().0);
+        assert!(x < strip_x - 1.0, "hint x {x} must be clear of strip at {strip_x}");
+        assert!(x > 0.0);
+        // The position along the edge is preserved.
+        assert_eq!(y, 900.0);
+    }
+
+    #[test]
+    fn release_hint_is_clamped_to_the_surface() {
+        let left = Barrier { id: 2, x1: 298, y1: 1728, x2: 298, y2: 2794 };
+        let (placed, _) = place(&[left], &outputs());
+        let p = &placed[0];
+        assert_eq!(p.release_hint(-5000.0).1, 0.0);
+        assert_eq!(p.release_hint(99999.0).1, 1065.0);
     }
 
     #[test]
