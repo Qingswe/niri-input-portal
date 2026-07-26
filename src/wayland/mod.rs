@@ -118,8 +118,6 @@ pub enum WaylandCmd {
     ClipboardClaim { mime_types: Vec<String> },
     /// Give up an earlier claim.
     ClipboardRelease,
-    /// Report the types on the current selection.
-    ClipboardMimeTypes { reply: oneshot::Sender<Vec<String>> },
     Shutdown,
 }
 

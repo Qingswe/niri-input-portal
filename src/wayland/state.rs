@@ -1044,14 +1044,6 @@ pub fn run(
                         let _ = cmd_conn.flush();
                     }
                 }
-                WaylandCmd::ClipboardMimeTypes { reply } => {
-                    let types = state
-                        .clipboard
-                        .as_ref()
-                        .map(ClipboardState::mime_types)
-                        .unwrap_or_default();
-                    let _ = reply.send(types);
-                }
                 WaylandCmd::Shutdown => state.exit = true,
             }
         })

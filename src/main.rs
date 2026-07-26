@@ -101,6 +101,8 @@ async fn serve() -> Result<()> {
         .context("failed to claim the backend bus name")?
         .serve_at(PORTAL_PATH, portal::InputCapture::new(state.clone()))
         .context("failed to export the InputCapture interface")?
+        .serve_at(PORTAL_PATH, portal::Clipboard::new(state.clone()))
+        .context("failed to export the Clipboard interface")?
         .serve_at(CONTROL_PATH, portal::Control::new(state.clone()))
         .context("failed to export the control interface")?
         .build()

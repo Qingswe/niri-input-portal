@@ -88,6 +88,10 @@ pub struct Session {
     pub enabled: bool,
     /// Non-zero while a capture run is in flight.
     pub activation_id: u32,
+    /// Set by `Clipboard.RequestClipboard`, which the spec requires before the
+    /// session starts. `Start` reports it back as `clipboard_enabled`, and every
+    /// other clipboard method refuses a session that never asked.
+    pub clipboard_requested: bool,
 }
 
 /// What the compositor says is on the clipboard right now.
@@ -106,6 +110,9 @@ pub struct ClipboardTracker {
     /// `SelectionWrite`. The fd is the compositor's own pipe: it is handed
     /// straight to the client so the content never passes through this process.
     pub transfers: HashMap<u32, std::os::fd::OwnedFd>,
+    /// Which session claimed the selection, so `SelectionTransfer` goes to the
+    /// one that can actually answer it.
+    pub owner_session: Option<OwnedObjectPath>,
     /// Insertion order, so the oldest transfer is the one evicted.
     order: std::collections::VecDeque<u32>,
     next_serial: u32,
@@ -205,7 +212,28 @@ impl State {
         self.wayland.send(WaylandCmd::ClipboardRelease);
         let mut clipboard = self.clipboard.lock().await;
         clipboard.owned_by_session = false;
+        clipboard.owner_session = None;
         clipboard.clear_transfers();
+    }
+
+    /// Sessions that may use the clipboard interface.
+    async fn clipboard_sessions(&self) -> Vec<OwnedObjectPath> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .values()
+            .filter(|s| s.clipboard_requested)
+            .map(|s| s.handle.clone())
+            .collect()
+    }
+
+    async fn session_has_clipboard(&self, handle: &OwnedObjectPath) -> bool {
+        let sessions = self.sessions.lock().await;
+        sessions.get(handle).is_some_and(|s| s.clipboard_requested)
+    }
+
+    /// Whether this session is the one currently holding the selection.
+    async fn owns_clipboard(&self, handle: &OwnedObjectPath) -> bool {
+        self.clipboard.lock().await.owner_session.as_ref() == Some(handle)
     }
 
     /// Find the enabled session that owns `barrier_id`.
@@ -296,6 +324,7 @@ impl InputCapture {
             barriers: Vec::new(),
             eis: None,
             enabled: false,
+            clipboard_requested: false,
             activation_id: 0,
         };
 
@@ -565,6 +594,172 @@ impl InputCapture {
     ) -> zbus::Result<()>;
 }
 
+/// `org.freedesktop.impl.portal.Clipboard`.
+///
+/// The clipboard portal creates no session of its own: it attaches to a session
+/// another portal already made, and xdg-desktop-portal only offers that to
+/// InputCapture sessions from 1.21.1 onwards. Against an older frontend
+/// everything here simply goes uncalled.
+pub struct Clipboard {
+    state: State,
+}
+
+impl Clipboard {
+    pub fn new(state: State) -> Self {
+        Self { state }
+    }
+}
+
+#[interface(name = "org.freedesktop.impl.portal.Clipboard")]
+impl Clipboard {
+    // Spelled lowercase in the spec, unlike every other member.
+    #[zbus(property, name = "version")]
+    fn version(&self) -> u32 {
+        1
+    }
+
+    /// Grant a session access to the clipboard.
+    ///
+    /// The spec puts this before the session starts, which is what lets `Start`
+    /// answer `clipboard_enabled` truthfully.
+    async fn request_clipboard(
+        &self,
+        session_handle: OwnedObjectPath,
+        _options: HashMap<String, OwnedValue>,
+    ) {
+        let mut sessions = self.state.sessions.lock().await;
+        match sessions.get_mut(&session_handle) {
+            Some(session) => {
+                session.clipboard_requested = true;
+                info!(session = %session_handle, "clipboard access granted");
+            }
+            None => warn!(session = %session_handle, "RequestClipboard for an unknown session"),
+        }
+    }
+
+    /// The session now holds clipboard content in these types.
+    ///
+    /// Claiming the selection discards whatever was on it, exactly as a local
+    /// copy would; there is no way to put the previous content back afterwards.
+    async fn set_selection(
+        &self,
+        session_handle: OwnedObjectPath,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        if !self.state.session_has_clipboard(&session_handle).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "this session has no clipboard access".into(),
+            ));
+        }
+
+        let mime_types: Vec<String> = options
+            .get("mime_types")
+            .and_then(|v| Vec::<String>::try_from(v.clone()).ok())
+            .unwrap_or_default();
+
+        if mime_types.is_empty() {
+            self.state.release_clipboard_claim().await;
+            return Ok(());
+        }
+
+        {
+            let mut clipboard = self.state.clipboard.lock().await;
+            clipboard.owner_session = Some(session_handle.clone());
+            // Reads parked against the previous owner cannot be answered from
+            // the new content, so let their readers see EOF now.
+            clipboard.clear_transfers();
+        }
+        info!(session = %session_handle, ?mime_types, "session claimed the clipboard");
+        self.state
+            .wayland
+            .send(WaylandCmd::ClipboardClaim { mime_types });
+        Ok(())
+    }
+
+    /// Hand over the pipe a pending read is waiting on.
+    ///
+    /// This is the compositor's own fd, passed straight through, so the content
+    /// goes from the client to whoever is pasting without a copy in between.
+    async fn selection_write(
+        &self,
+        session_handle: OwnedObjectPath,
+        serial: u32,
+    ) -> zbus::fdo::Result<zvariant::OwnedFd> {
+        if !self.state.session_has_clipboard(&session_handle).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "this session has no clipboard access".into(),
+            ));
+        }
+        let fd = self
+            .state
+            .clipboard
+            .lock()
+            .await
+            .take_transfer(serial)
+            .ok_or_else(|| {
+                // Either the client is answering twice, or the read waited long
+                // enough to be evicted.
+                zbus::fdo::Error::InvalidArgs(format!("no clipboard transfer with serial {serial}"))
+            })?;
+        Ok(zvariant::OwnedFd::from(fd))
+    }
+
+    /// The client finished writing, successfully or not.
+    ///
+    /// Nothing is left to do either way: the fd left this process with
+    /// `SelectionWrite`, and closing it is what ends the transfer.
+    async fn selection_write_done(
+        &self,
+        session_handle: OwnedObjectPath,
+        serial: u32,
+        success: bool,
+    ) {
+        if !success {
+            warn!(session = %session_handle, serial, "the client failed to write clipboard content");
+        }
+    }
+
+    /// Read the current selection, as the read end of a pipe.
+    async fn selection_read(
+        &self,
+        session_handle: OwnedObjectPath,
+        mime_type: String,
+    ) -> zbus::fdo::Result<zvariant::OwnedFd> {
+        if !self.state.session_has_clipboard(&session_handle).await {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "this session has no clipboard access".into(),
+            ));
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.state.wayland.send(WaylandCmd::ClipboardRead {
+            mime_type: mime_type.clone(),
+            reply: reply_tx,
+        });
+        let fd = reply_rx
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("nothing offers {mime_type}")))?;
+        Ok(zvariant::OwnedFd::from(fd))
+    }
+
+    #[zbus(signal)]
+    pub async fn selection_owner_changed(
+        emitter: &SignalEmitter<'_>,
+        session_handle: ObjectPath<'_>,
+        options: HashMap<String, Value<'_>>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub async fn selection_transfer(
+        emitter: &SignalEmitter<'_>,
+        session_handle: ObjectPath<'_>,
+        mime_type: &str,
+        serial: u32,
+    ) -> zbus::Result<()>;
+}
+
 /// Out-of-band control, deliberately not on the spec interface.
 ///
 /// This exists because every in-band escape can fail: the keyboard is grabbed,
@@ -769,6 +964,11 @@ impl SessionObject {
     ) {
         info!(session = %self.handle.as_str(), "session closed by portal");
         self.state.sessions.lock().await.remove(&self.handle);
+        // A selection whose owner has gone is a clipboard that hangs every paste
+        // on this machine, so the claim has to go with the session.
+        if self.state.owns_clipboard(&self.handle).await {
+            self.state.release_clipboard_claim().await;
+        }
         let _ = Self::closed(&emitter).await;
         let _ = object_server
             .remove::<SessionObject, _>(&self.handle)
@@ -833,6 +1033,29 @@ pub async fn activate(
     InputCapture::activated(&emitter, session_handle.as_ref(), options).await
 }
 
+/// Tell every clipboard-enabled session what is on the selection now.
+async fn announce_selection(
+    state: &State,
+    conn: &zbus::Connection,
+    mime_types: &[String],
+    is_ours: bool,
+) {
+    for handle in state.clipboard_sessions().await {
+        let Ok(emitter) = SignalEmitter::new(conn, PORTAL_PATH) else {
+            continue;
+        };
+        let mut options: HashMap<String, Value<'_>> = HashMap::new();
+        options.insert("mime_types".into(), Value::from(mime_types.to_vec()));
+        options.insert("session_is_owner".into(), Value::from(is_ours));
+
+        if let Err(err) =
+            Clipboard::selection_owner_changed(&emitter, handle.as_ref(), options).await
+        {
+            error!("failed to emit SelectionOwnerChanged: {err}");
+        }
+    }
+}
+
 /// Drive portal signals from what the Wayland thread observes.
 pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiver<WaylandEvent>) {
     while let Some(event) = events.recv().await {
@@ -876,19 +1099,44 @@ pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiv
                 mime_types,
                 is_ours,
             } => {
-                let mut clipboard = state.clipboard.lock().await;
-                clipboard.mime_types = mime_types;
-                clipboard.owned_by_session = is_ours;
+                {
+                    let mut clipboard = state.clipboard.lock().await;
+                    clipboard.mime_types.clone_from(&mime_types);
+                    clipboard.owned_by_session = is_ours;
+                }
+                // Every session with clipboard access needs to know, so it can
+                // offer the new content to the machine on the other end.
+                announce_selection(&state, &conn, &mime_types, is_ours).await;
             }
             WaylandEvent::ClipboardSend { mime_type, fd } => {
-                let serial = state.clipboard.lock().await.begin_transfer(fd);
-                debug!(mime_type, serial, "a local paste is waiting on the session");
+                let (serial, owner) = {
+                    let mut clipboard = state.clipboard.lock().await;
+                    (clipboard.begin_transfer(fd), clipboard.owner_session.clone())
+                };
+                let Some(owner) = owner else {
+                    debug!(mime_type, "a paste arrived for a claim with no session behind it");
+                    continue;
+                };
+                debug!(mime_type, serial, "asking the session for clipboard content");
+                let Ok(emitter) = SignalEmitter::new(&conn, PORTAL_PATH) else {
+                    continue;
+                };
+                if let Err(err) =
+                    Clipboard::selection_transfer(&emitter, owner.as_ref(), &mime_type, serial).await
+                {
+                    error!("failed to emit SelectionTransfer: {err}");
+                }
             }
             WaylandEvent::ClipboardCancelled => {
-                let mut clipboard = state.clipboard.lock().await;
-                clipboard.owned_by_session = false;
-                // Nobody is going to answer these now.
-                clipboard.clear_transfers();
+                let mime_types = {
+                    let mut clipboard = state.clipboard.lock().await;
+                    clipboard.owned_by_session = false;
+                    clipboard.owner_session = None;
+                    // Nobody is going to answer these now.
+                    clipboard.clear_transfers();
+                    clipboard.mime_types.clone()
+                };
+                announce_selection(&state, &conn, &mime_types, false).await;
             }
             WaylandEvent::OutputsChanged => {
                 // Zones are stale for every session; the spec says clients must
