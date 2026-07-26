@@ -29,12 +29,25 @@ async fn main() -> Result<()> {
 
     // These run against an already-running instance and exit; they exist so a
     // stranded pointer can be recovered over SSH without knowing D-Bus syntax.
-    match std::env::args().nth(1).as_deref() {
-        Some("--release") => return call_control("ForceRelease").await,
-        Some("--disarm") => return call_control("Disarm").await,
-        Some("--status") => return call_control("Status").await,
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--release") => return call_control("ForceRelease", &()).await,
+        Some("--disarm") => return call_control("Disarm", &()).await,
+        Some("--status") => return call_control("Status", &()).await,
+        Some("--clip-status") => return call_control("ClipboardStatus", &()).await,
+        // Defaults to the type every clipboard carries, so the common check is
+        // just `--clip-read`.
+        Some("--clip-read") => {
+            let mime = args.get(1).cloned().unwrap_or_else(|| "text/plain".to_owned());
+            return call_control("ClipboardRead", &(mime,)).await;
+        }
+        Some("--clip-claim") => {
+            let mimes: Vec<String> = args[1..].to_vec();
+            return call_control("ClipboardClaim", &(mimes,)).await;
+        }
         Some(other) => anyhow::bail!(
-            "unknown argument {other:?}; expected --release, --disarm or --status"
+            "unknown argument {other:?}; expected --release, --disarm, --status, \
+             --clip-status, --clip-read [mime-type] or --clip-claim [mime-type...]"
         ),
         None => {}
     }
@@ -43,12 +56,15 @@ async fn main() -> Result<()> {
 }
 
 /// Invoke a method on a running instance and print what it says.
-async fn call_control(method: &str) -> Result<()> {
+async fn call_control<B>(method: &str, body: &B) -> Result<()>
+where
+    B: serde::Serialize + zbus::zvariant::DynamicType,
+{
     let conn = zbus::Connection::session()
         .await
         .context("failed to connect to the session bus")?;
     let reply: String = conn
-        .call_method(Some(BUS_NAME), CONTROL_PATH, Some(CONTROL_IFACE), method, &())
+        .call_method(Some(BUS_NAME), CONTROL_PATH, Some(CONTROL_IFACE), method, body)
         .await
         .with_context(|| format!("{method} failed; is niri-input-portal running?"))?
         .body()

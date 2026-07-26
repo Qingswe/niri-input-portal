@@ -1,5 +1,6 @@
 //! The Wayland client that owns the barrier surfaces and the capture grab.
 
+use super::clipboard::{ClipboardHandler, ClipboardState};
 use super::{place, Edge, PlacedBarrier, WaylandCmd, WaylandEvent};
 use crate::eis_server::{EisCommand, EisHandle, SharedKeymap};
 use anyhow::{Context, Result};
@@ -97,6 +98,9 @@ struct AppState {
     last_enter_serial: u32,
     surfaces: Vec<BarrierSurface>,
     capture: Option<Capture>,
+    /// Absent when the compositor does not advertise `ext-data-control`, which
+    /// costs the clipboard but nothing else.
+    clipboard: Option<ClipboardState>,
     /// How long a capture may see no input at all before it is force-released.
     idle_timeout: std::time::Duration,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
@@ -606,6 +610,13 @@ impl SeatHandler for AppState {
                     Ok(k) => self.keyboard = Some(k),
                     Err(err) => warn!("failed to acquire the keyboard: {err}"),
                 }
+                // The data-control device hangs off a seat too, and the
+                // clipboard is watched for the whole life of the process rather
+                // than only during a capture: the portal has to be able to
+                // answer what is on the clipboard at any moment.
+                if let Some(clipboard) = &mut self.clipboard {
+                    clipboard.watch_seat(&seat, qh);
+                }
             }
             _ => {}
         }
@@ -905,6 +916,32 @@ impl ShmHandler for AppState {
     }
 }
 
+impl ClipboardHandler for AppState {
+    fn clipboard(&mut self) -> Option<&mut ClipboardState> {
+        self.clipboard.as_mut()
+    }
+
+    fn selection_changed(&mut self, mime_types: Vec<String>, is_ours: bool) {
+        debug!(?mime_types, is_ours, "clipboard selection changed");
+        let _ = self
+            .event_tx
+            .send(WaylandEvent::ClipboardSelection { mime_types, is_ours });
+    }
+
+    fn selection_send(&mut self, mime_type: String, fd: std::os::fd::OwnedFd) {
+        // The fd travels on to whoever holds the clipboard content — the portal
+        // client — so that the bytes are never copied through this process.
+        let _ = self
+            .event_tx
+            .send(WaylandEvent::ClipboardSend { mime_type, fd });
+    }
+
+    fn selection_cancelled(&mut self) {
+        debug!("another client took the clipboard from us");
+        let _ = self.event_tx.send(WaylandEvent::ClipboardCancelled);
+    }
+}
+
 impl ProvidesRegistryState for AppState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -935,6 +972,13 @@ pub fn run(
     let shm = Shm::bind(&globals, &qh).context("wl_shm global is missing")?;
     let pool = SlotPool::new(4096, &shm).context("failed to create an shm pool")?;
     let pointer_constraints = PointerConstraintsState::bind(&globals, &qh);
+    let clipboard = match ClipboardState::bind(&globals, &qh) {
+        Ok(c) => Some(c),
+        Err(err) => {
+            warn!("no ext_data_control_manager_v1 ({err}); clipboard sharing is unavailable");
+            None
+        }
+    };
 
     let mut state = AppState {
         registry_state: RegistryState::new(&globals),
@@ -954,6 +998,7 @@ pub fn run(
         last_enter_serial: 0,
         surfaces: Vec::new(),
         capture: None,
+        clipboard,
         idle_timeout,
         event_tx,
         exit: false,
@@ -968,6 +1013,7 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("failed to register the Wayland source: {e}"))?;
 
     let cmd_qh = qh.clone();
+    let cmd_conn = conn.clone();
     handle
         .insert_source(cmd_rx, move |event, (), state: &mut AppState| {
             let calloop::channel::Event::Msg(cmd) = event else {
@@ -978,6 +1024,34 @@ pub fn run(
                 WaylandCmd::Disarm => state.disarm(),
                 WaylandCmd::AttachEis(eis) => state.attach_eis(eis),
                 WaylandCmd::EndCapture { cursor_hint } => state.end_capture(cursor_hint),
+                WaylandCmd::ClipboardRead { mime_type, reply } => {
+                    let fd = state.clipboard.as_ref().and_then(|c| c.read(&mime_type));
+                    // The caller is about to block reading this pipe, so the
+                    // `receive` request has to be on the wire before we answer —
+                    // the loop's own flush comes too late.
+                    let _ = cmd_conn.flush();
+                    let _ = reply.send(fd);
+                }
+                WaylandCmd::ClipboardClaim { mime_types } => {
+                    if let Some(clipboard) = &mut state.clipboard {
+                        clipboard.claim(&mime_types, &cmd_qh);
+                        let _ = cmd_conn.flush();
+                    }
+                }
+                WaylandCmd::ClipboardRelease => {
+                    if let Some(clipboard) = &mut state.clipboard {
+                        clipboard.release();
+                        let _ = cmd_conn.flush();
+                    }
+                }
+                WaylandCmd::ClipboardMimeTypes { reply } => {
+                    let types = state
+                        .clipboard
+                        .as_ref()
+                        .map(ClipboardState::mime_types)
+                        .unwrap_or_default();
+                    let _ = reply.send(types);
+                }
                 WaylandCmd::Shutdown => state.exit = true,
             }
         })

@@ -90,9 +90,74 @@ pub struct Session {
     pub activation_id: u32,
 }
 
+/// What the compositor says is on the clipboard right now.
+///
+/// Mirrored here rather than asked for on demand so that `SelectionOwnerChanged`
+/// can be emitted the moment it changes, which is the only way a client learns
+/// there is something new to copy across.
+#[derive(Debug, Default)]
+pub struct ClipboardTracker {
+    pub mime_types: Vec<String>,
+    /// True while the selection belongs to a portal session rather than a local
+    /// application — the difference between "the remote machine copied this" and
+    /// "this machine copied this".
+    pub owned_by_session: bool,
+    /// Reads of a session-owned selection, waiting for the client to answer with
+    /// `SelectionWrite`. The fd is the compositor's own pipe: it is handed
+    /// straight to the client so the content never passes through this process.
+    pub transfers: HashMap<u32, std::os::fd::OwnedFd>,
+    /// Insertion order, so the oldest transfer is the one evicted.
+    order: std::collections::VecDeque<u32>,
+    next_serial: u32,
+}
+
+/// How many unanswered reads to hold before dropping the oldest.
+///
+/// Every parked transfer is an open pipe. A client that is doing its job answers
+/// within a round trip, so a backlog means nobody is going to: local applications
+/// poll the clipboard constantly — a clipboard manager alone produces a steady
+/// trickle — and without a cap those pipes accumulate until the process runs out
+/// of file descriptors. Dropping the fd closes the pipe, which the waiting
+/// application reads as "no data", the honest answer when the claim is unbacked.
+const MAX_PENDING_TRANSFERS: usize = 16;
+
+impl ClipboardTracker {
+    /// Park a pending read and return the serial the client answers with.
+    fn begin_transfer(&mut self, fd: std::os::fd::OwnedFd) -> u32 {
+        // Serial 0 is reserved so a missing value cannot look like a valid one.
+        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        let serial = self.next_serial;
+        self.transfers.insert(serial, fd);
+        self.order.push_back(serial);
+
+        while self.order.len() > MAX_PENDING_TRANSFERS {
+            if let Some(stale) = self.order.pop_front() {
+                // Dropping the fd is what signals EOF to the reader.
+                if self.transfers.remove(&stale).is_some() {
+                    debug!(serial = stale, "dropping an unanswered clipboard transfer");
+                }
+            }
+        }
+        serial
+    }
+
+    /// Hand a parked transfer to the client that asked for it.
+    pub fn take_transfer(&mut self, serial: u32) -> Option<std::os::fd::OwnedFd> {
+        self.order.retain(|s| *s != serial);
+        self.transfers.remove(&serial)
+    }
+
+    /// Abandon every parked transfer, closing their pipes.
+    pub fn clear_transfers(&mut self) {
+        self.order.clear();
+        self.transfers.clear();
+    }
+}
+
 #[derive(Clone)]
 pub struct State {
     sessions: Arc<Mutex<HashMap<OwnedObjectPath, Session>>>,
+    clipboard: Arc<Mutex<ClipboardTracker>>,
     next_zone_set: Arc<AtomicU32>,
     next_activation: Arc<AtomicU32>,
     wayland: Arc<WaylandHandle>,
@@ -112,6 +177,7 @@ impl State {
         let (eis_closed, closed_rx) = mpsc::unbounded_channel();
         let state = Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            clipboard: Arc::new(Mutex::new(ClipboardTracker::default())),
             next_zone_set: Arc::new(AtomicU32::new(1)),
             next_activation: Arc::new(AtomicU32::new(1)),
             wayland,
@@ -128,6 +194,18 @@ impl State {
 
     fn connection(&self) -> Option<&zbus::Connection> {
         self.conn.get()
+    }
+
+    /// Give up the clipboard claim and abandon whatever reads were waiting on it.
+    ///
+    /// The two go together: once the selection is no longer ours, no `SelectionWrite`
+    /// can arrive for a parked transfer, so holding those pipes open would leave the
+    /// applications blocked on them waiting for a write that will never come.
+    pub async fn release_clipboard_claim(&self) {
+        self.wayland.send(WaylandCmd::ClipboardRelease);
+        let mut clipboard = self.clipboard.lock().await;
+        clipboard.owned_by_session = false;
+        clipboard.clear_transfers();
     }
 
     /// Find the enabled session that owns `barrier_id`.
@@ -549,6 +627,68 @@ impl Control {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// What the compositor currently offers on the clipboard.
+    ///
+    /// This exists so the data-control layer can be checked on its own, without
+    /// a portal client: `wl-copy hi` then `--clip-status` should list
+    /// `text/plain`.
+    async fn clipboard_status(&self) -> String {
+        let clipboard = self.state.clipboard.lock().await;
+        if clipboard.mime_types.is_empty() {
+            return "clipboard is empty (or ext-data-control is unavailable)".to_owned();
+        }
+        format!(
+            "owner={} pending_transfers={} types:\n  {}",
+            if clipboard.owned_by_session { "session" } else { "local" },
+            clipboard.transfers.len(),
+            clipboard.mime_types.join("\n  ")
+        )
+    }
+
+    /// Read the clipboard as text, for checking the read path end to end.
+    async fn clipboard_read(&self, mime_type: String) -> String {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.state.wayland.send(WaylandCmd::ClipboardRead {
+            mime_type: mime_type.clone(),
+            reply: reply_tx,
+        });
+
+        let Ok(Some(fd)) = reply_rx.await else {
+            return format!("nothing on the clipboard for {mime_type}");
+        };
+        // The owner writes into the pipe from its own event loop, so this has to
+        // happen off the reactor thread.
+        match tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = std::fs::File::from(fd);
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).map(|_| buf)
+        })
+        .await
+        {
+            Ok(Ok(buf)) => String::from_utf8_lossy(&buf).into_owned(),
+            Ok(Err(err)) => format!("read failed: {err}"),
+            Err(err) => format!("read task failed: {err}"),
+        }
+    }
+
+    /// Claim the clipboard without a session behind it.
+    ///
+    /// Only useful for checking the ownership half of the data-control layer: a
+    /// local paste afterwards shows up as a pending transfer that nothing will
+    /// ever answer, which is exactly what an unbacked claim should look like.
+    async fn clipboard_claim(&self, mime_types: Vec<String>) -> String {
+        if mime_types.is_empty() {
+            self.state.release_clipboard_claim().await;
+            return "released the clipboard claim".to_owned();
+        }
+        let listed = mime_types.join(", ");
+        self.state
+            .wayland
+            .send(WaylandCmd::ClipboardClaim { mime_types });
+        format!("claimed the clipboard for {listed}")
+    }
 }
 
 /// End every in-flight capture, returning the sessions that were active.
@@ -732,6 +872,24 @@ pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiv
                     state.wayland.send(WaylandCmd::Arm(barriers));
                 }
             }
+            WaylandEvent::ClipboardSelection {
+                mime_types,
+                is_ours,
+            } => {
+                let mut clipboard = state.clipboard.lock().await;
+                clipboard.mime_types = mime_types;
+                clipboard.owned_by_session = is_ours;
+            }
+            WaylandEvent::ClipboardSend { mime_type, fd } => {
+                let serial = state.clipboard.lock().await.begin_transfer(fd);
+                debug!(mime_type, serial, "a local paste is waiting on the session");
+            }
+            WaylandEvent::ClipboardCancelled => {
+                let mut clipboard = state.clipboard.lock().await;
+                clipboard.owned_by_session = false;
+                // Nobody is going to answer these now.
+                clipboard.clear_transfers();
+            }
             WaylandEvent::OutputsChanged => {
                 // Zones are stale for every session; the spec says clients must
                 // call GetZones again as soon as they see this.
@@ -780,4 +938,56 @@ pub async fn deactivate(
     options.insert("cursor_position".into(), Value::from((cursor.0, cursor.1)));
 
     InputCapture::deactivated(&emitter, session_handle.as_ref(), options).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_pipe() -> std::os::fd::OwnedFd {
+        // The read end: an fd whose only job here is to be held and dropped.
+        rustix::pipe::pipe().expect("pipe").0
+    }
+
+    #[test]
+    fn parked_transfers_are_capped() {
+        let mut tracker = ClipboardTracker::default();
+        for _ in 0..MAX_PENDING_TRANSFERS * 3 {
+            tracker.begin_transfer(a_pipe());
+        }
+        // Local applications poll the clipboard indefinitely; without the cap
+        // this is where the process runs out of file descriptors.
+        assert_eq!(tracker.transfers.len(), MAX_PENDING_TRANSFERS);
+        assert_eq!(tracker.order.len(), MAX_PENDING_TRANSFERS);
+    }
+
+    #[test]
+    fn the_oldest_transfer_is_the_one_dropped() {
+        let mut tracker = ClipboardTracker::default();
+        let first = tracker.begin_transfer(a_pipe());
+        for _ in 0..MAX_PENDING_TRANSFERS {
+            tracker.begin_transfer(a_pipe());
+        }
+        assert!(
+            tracker.take_transfer(first).is_none(),
+            "the oldest transfer should have been evicted, not a newer one"
+        );
+    }
+
+    #[test]
+    fn taking_a_transfer_removes_it_once() {
+        let mut tracker = ClipboardTracker::default();
+        let serial = tracker.begin_transfer(a_pipe());
+        assert!(tracker.take_transfer(serial).is_some());
+        assert!(tracker.take_transfer(serial).is_none());
+        assert!(tracker.order.is_empty(), "order must not keep a taken serial");
+    }
+
+    #[test]
+    fn serials_never_reuse_zero() {
+        // Zero is the "no such transfer" value, so a wrap must skip it.
+        let mut tracker = ClipboardTracker { next_serial: u32::MAX, ..Default::default() };
+        let serial = tracker.begin_transfer(a_pipe());
+        assert_ne!(serial, 0);
+    }
 }

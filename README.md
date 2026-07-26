@@ -125,10 +125,6 @@ exiting after 0.13s in a restart loop.
 
 Installed and verified on niri 25.11, xdg-desktop-portal 1.20.4, libei 1.5.0.
 
-**Capture does not work yet.** Barriers are accepted and stored but nothing watches
-them, so moving the pointer at a screen edge will not switch to the remote machine.
-That is phase 2 and 3.
-
 ## Build
 
 ```sh

@@ -8,13 +8,18 @@
 //! Wayland event queues are not `Send`, so all of this lives on its own thread
 //! and talks to the portal through calloop channels.
 
+mod clipboard;
 mod state;
+
 
 use crate::portal::Barrier;
 use anyhow::{Context, Result};
+use std::os::fd::OwnedFd;
 use std::thread;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
+
+use smithay_client_toolkit::reexports::protocols as wayland_protocols;
 
 /// Which screen edge a barrier sits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +105,21 @@ pub enum WaylandCmd {
         /// Where to leave the cursor, in global logical coordinates.
         cursor_hint: Option<(f64, f64)>,
     },
+    /// Ask the selection owner for the clipboard content.
+    ///
+    /// The reply is the read end of a pipe the owner writes into, so the bytes
+    /// never pass through this process. `None` means nothing is on the clipboard
+    /// in that type.
+    ClipboardRead {
+        mime_type: String,
+        reply: oneshot::Sender<Option<OwnedFd>>,
+    },
+    /// Take ownership of the clipboard, advertising these types.
+    ClipboardClaim { mime_types: Vec<String> },
+    /// Give up an earlier claim.
+    ClipboardRelease,
+    /// Report the types on the current selection.
+    ClipboardMimeTypes { reply: oneshot::Sender<Vec<String>> },
     Shutdown,
 }
 
@@ -114,6 +134,17 @@ pub enum WaylandEvent {
     CaptureLost,
     /// The output layout changed; zones and barriers are stale.
     OutputsChanged,
+    /// The clipboard selection changed. `is_ours` distinguishes a change this
+    /// process caused from one a local application caused.
+    ClipboardSelection {
+        mime_types: Vec<String>,
+        is_ours: bool,
+    },
+    /// Somebody is pasting from the selection this process claimed, and wants
+    /// the content written into `fd`.
+    ClipboardSend { mime_type: String, fd: OwnedFd },
+    /// The claim was taken over by another client.
+    ClipboardCancelled,
 }
 
 pub struct WaylandHandle {
