@@ -713,11 +713,14 @@ impl PointerHandler for AppState {
                     } else {
                         (horizontal.discrete * 120, vertical.discrete * 120)
                     };
+                    // Per libei protocol specification, discrete and smooth scroll requests
+                    // are mutually exclusive for the same event frame (the EIS implementation
+                    // emulates whichever is not sent). Sending both causes receivers that handle
+                    // both (such as Deskflow) to double every scroll click.
                     if hd != 0 || vd != 0 {
                         self.forward(EisCommand::ScrollDiscrete { dx: hd, dy: vd });
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    if horizontal.absolute != 0.0 || vertical.absolute != 0.0 {
+                    } else if horizontal.absolute != 0.0 || vertical.absolute != 0.0 {
+                        #[allow(clippy::cast_possible_truncation)]
                         self.forward(EisCommand::Scroll {
                             dx: horizontal.absolute as f32,
                             dy: vertical.absolute as f32,
