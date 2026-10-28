@@ -9,7 +9,10 @@
 //! and talks to the portal through calloop channels.
 
 mod clipboard;
+pub mod latch;
 mod state;
+
+pub use latch::{EdgeLatch, EnterAction};
 
 
 use crate::portal::Barrier;
@@ -43,7 +46,19 @@ pub const BARRIER_DEPTH: u32 = 64;
 ///
 /// Far enough that it is clear of the input region and cannot immediately
 /// retrigger the barrier it just came back through.
-pub const RELEASE_INSET: f64 = 8.0;
+pub const RELEASE_INSET: f64 = 32.0;
+
+/// Re-entry debounce window to prevent rapid edge ping-pong loops.
+pub const DEBOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Minimum capture duration or activity threshold to consider a capture productive.
+pub const MIN_PRODUCTIVE_DURATION: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Fallback timeout to unlatch a declined border if cursor was not physically pulled away.
+pub const LATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Default tick interval for the Wayland event loop.
+pub const DISPATCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// A barrier resolved against the current output layout.
 #[derive(Debug, Clone)]

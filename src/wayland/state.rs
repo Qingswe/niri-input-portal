@@ -1,7 +1,10 @@
 //! The Wayland client that owns the barrier surfaces and the capture grab.
 
 use super::clipboard::{ClipboardHandler, ClipboardState};
-use super::{place, Edge, PlacedBarrier, WaylandCmd, WaylandEvent};
+use super::{
+    place, Edge, EdgeLatch, EnterAction, PlacedBarrier, WaylandCmd, WaylandEvent,
+    DEBOUNCE_INTERVAL, DISPATCH_TICK_INTERVAL, LATCH_TIMEOUT, MIN_PRODUCTIVE_DURATION,
+};
 use crate::eis_server::{EisCommand, EisHandle, SharedKeymap};
 use anyhow::{Context, Result};
 use smithay_client_toolkit::{
@@ -76,11 +79,13 @@ struct Capture {
     keys: u32,
     buttons: u32,
     scrolls: u32,
+    created_at: std::time::Instant,
     /// Last time anything at all was captured, for the idle watchdog.
     last_input: std::time::Instant,
 }
 
 struct AppState {
+    qh: QueueHandle<AppState>,
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
@@ -103,6 +108,8 @@ struct AppState {
     clipboard: Option<ClipboardState>,
     /// How long a capture may see no input at all before it is force-released.
     idle_timeout: std::time::Duration,
+    edge_latch: EdgeLatch,
+    pending_enter: Option<(usize, (f64, f64))>,
     event_tx: mpsc::UnboundedSender<WaylandEvent>,
     exit: bool,
 }
@@ -133,6 +140,7 @@ impl AppState {
     }
 
     fn disarm(&mut self) {
+        self.pending_enter = None;
         if !self.surfaces.is_empty() {
             debug!("tearing down {} barrier surface(s)", self.surfaces.len());
         }
@@ -317,6 +325,7 @@ impl AppState {
             keys: 0,
             buttons: 0,
             scrolls: 0,
+            created_at: std::time::Instant::now(),
             last_input: std::time::Instant::now(),
         });
 
@@ -342,10 +351,51 @@ impl AppState {
         capture.eis = Some(eis);
     }
 
+    fn check_pending_enter(&mut self) {
+        if let Some((index, position)) = self.pending_enter {
+            let now = std::time::Instant::now();
+            match self.edge_latch.on_enter(now, DEBOUNCE_INTERVAL) {
+                EnterAction::Capture => {
+                    self.pending_enter = None;
+                    if index < self.surfaces.len() {
+                        debug!(index, ?position, "replaying pending barrier enter after debounce");
+                        let qh = self.qh.clone();
+                        self.begin_capture(index, position, &qh);
+                    }
+                }
+                EnterAction::Ignore => {
+                    self.pending_enter = None;
+                }
+                EnterAction::Defer => {}
+            }
+        }
+    }
+
+    fn tick_latch(&mut self, now: std::time::Instant) {
+        self.edge_latch.maybe_timeout_unlatch(now, LATCH_TIMEOUT);
+    }
+
+    fn next_dispatch_timeout(&self) -> std::time::Duration {
+        let mut min_timeout = DISPATCH_TICK_INTERVAL;
+
+        if self.pending_enter.is_some() {
+            min_timeout = min_timeout.min(std::time::Duration::from_millis(10));
+        }
+
+        min_timeout
+    }
+
     fn end_capture(&mut self, cursor_hint: Option<(f64, f64)>) {
         let Some(capture) = self.capture.take() else {
             return;
         };
+
+        let productive = capture.buttons > 0
+            || capture.scrolls > 0
+            || capture.keys > 0
+            || capture.created_at.elapsed() >= MIN_PRODUCTIVE_DURATION;
+        self.edge_latch.on_release(std::time::Instant::now(), productive);
+        self.pending_enter = None;
 
         // Where along the edge to come back. The client's suggestion is only
         // used when it is actually usable: Synergy 3.7 sends a constant (1, 0)
@@ -675,7 +725,40 @@ impl PointerHandler for AppState {
                         f64::from(s.origin.0) + event.position.0,
                         f64::from(s.origin.1) + event.position.1,
                     );
-                    self.begin_capture(index, position, qh);
+                    let now = std::time::Instant::now();
+                    match self.edge_latch.on_enter(now, DEBOUNCE_INTERVAL) {
+                        EnterAction::Ignore => {
+                            debug!("ignoring barrier enter: edge is latched quiet after client decline");
+                            continue;
+                        }
+                        EnterAction::Defer => {
+                            debug!("deferring barrier enter within debounce window; recording pending enter");
+                            self.pending_enter = Some((index, position));
+                            continue;
+                        }
+                        EnterAction::Capture => {
+                            self.pending_enter = None;
+                            self.begin_capture(index, position, qh);
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } => {
+                    self.edge_latch.on_leave();
+                    if self.pending_enter.is_some() {
+                        debug!("pointer left barrier surface; cancelling pending enter");
+                        self.pending_enter = None;
+                    }
+                }
+                PointerEventKind::Motion { .. } => {
+                    if let Some((index, ref mut pos)) = self.pending_enter
+                        && index < self.surfaces.len()
+                        && self.surfaces[index].layer.wl_surface() == &event.surface
+                    {
+                        *pos = (
+                            f64::from(self.surfaces[index].origin.0) + event.position.0,
+                            f64::from(self.surfaces[index].origin.1) + event.position.1,
+                        );
+                    }
                 }
                 PointerEventKind::Press { button, .. } => {
                     if self.capture.is_some() {
@@ -713,11 +796,14 @@ impl PointerHandler for AppState {
                     } else {
                         (horizontal.discrete * 120, vertical.discrete * 120)
                     };
+                    // Per libei protocol specification, discrete and smooth scroll requests
+                    // are mutually exclusive for the same event frame (the EIS implementation
+                    // emulates whichever is not sent). Sending both causes receivers that handle
+                    // both (such as Deskflow) to double every scroll click.
                     if hd != 0 || vd != 0 {
                         self.forward(EisCommand::ScrollDiscrete { dx: hd, dy: vd });
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    if horizontal.absolute != 0.0 || vertical.absolute != 0.0 {
+                    } else if horizontal.absolute != 0.0 || vertical.absolute != 0.0 {
+                        #[allow(clippy::cast_possible_truncation)]
                         self.forward(EisCommand::Scroll {
                             dx: horizontal.absolute as f32,
                             dy: vertical.absolute as f32,
@@ -725,7 +811,6 @@ impl PointerHandler for AppState {
                     }
                     self.forward_frame();
                 }
-                PointerEventKind::Motion { .. } | PointerEventKind::Leave { .. } => {}
             }
         }
     }
@@ -981,6 +1066,7 @@ pub fn run(
     };
 
     let mut state = AppState {
+        qh: qh.clone(),
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
@@ -1000,6 +1086,8 @@ pub fn run(
         capture: None,
         clipboard,
         idle_timeout,
+        edge_latch: EdgeLatch::new(),
+        pending_enter: None,
         event_tx,
         exit: false,
     };
@@ -1059,9 +1147,12 @@ pub fn run(
     let _ = ready.send(Ok(()));
 
     while !state.exit {
+        let timeout = state.next_dispatch_timeout();
         event_loop
-            .dispatch(std::time::Duration::from_millis(200), &mut state)
+            .dispatch(timeout, &mut state)
             .context("Wayland dispatch failed")?;
+        state.tick_latch(std::time::Instant::now());
+        state.check_pending_enter();
         // The dispatch timeout doubles as the watchdog tick.
         state.check_watchdog();
     }

@@ -17,13 +17,14 @@ use reis::{
     PendingRequestResult,
 };
 use std::{
+    collections::HashSet,
     os::fd::{AsFd, OwnedFd},
     os::unix::net::UnixStream,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{io::unix::AsyncFd, sync::mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Everything the capture side can ask the EIS connection to emit.
 #[derive(Debug, Clone)]
@@ -79,6 +80,8 @@ struct Devices {
     keyboard: Option<reis::request::Device>,
     pointer: Option<reis::request::Device>,
     emulating: bool,
+    pressed_keys: HashSet<u32>,
+    pressed_buttons: HashSet<u32>,
 }
 
 impl Devices {
@@ -95,10 +98,50 @@ impl Devices {
                     dev.start_emulating(*sequence);
                 }
                 self.emulating = true;
+                return;
             }
             EisCommand::StopEmulating => {
                 if !self.emulating {
                     return;
+                }
+                // Release any pressed buttons or keys before stopping emulation to avoid stuck inputs.
+                let mut released_any = false;
+                if !self.pressed_buttons.is_empty() {
+                    if let Some(b) = self
+                        .pointer
+                        .as_ref()
+                        .and_then(reis::request::Device::interface::<eis::Button>)
+                    {
+                        for button in self.pressed_buttons.drain() {
+                            b.button(button, eis::button::ButtonState::Released);
+                            released_any = true;
+                        }
+                    } else {
+                        self.pressed_buttons.clear();
+                    }
+                }
+                if !self.pressed_keys.is_empty() {
+                    if let Some(k) = self
+                        .keyboard
+                        .as_ref()
+                        .and_then(reis::request::Device::interface::<eis::Keyboard>)
+                    {
+                        for keycode in self.pressed_keys.drain() {
+                            k.key(keycode, eis::keyboard::KeyState::Released);
+                            released_any = true;
+                        }
+                    } else {
+                        self.pressed_keys.clear();
+                    }
+                }
+                if released_any {
+                    let time = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    for dev in [self.pointer.as_ref(), self.keyboard.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        dev.frame(time);
+                    }
                 }
                 for dev in [self.pointer.as_ref(), self.keyboard.as_ref()]
                     .into_iter()
@@ -107,7 +150,18 @@ impl Devices {
                     dev.stop_emulating();
                 }
                 self.emulating = false;
+                return;
             }
+            _ => {}
+        }
+
+        if !self.emulating {
+            trace!("dropping command {cmd:?} while device is not emulating");
+            return;
+        }
+
+        match cmd {
+            EisCommand::StartEmulating { .. } | EisCommand::StopEmulating => unreachable!(),
             EisCommand::Motion { dx, dy } => {
                 if let Some(p) = self
                     .pointer
@@ -118,6 +172,11 @@ impl Devices {
                 }
             }
             EisCommand::Button { button, press } => {
+                if *press {
+                    self.pressed_buttons.insert(*button);
+                } else {
+                    self.pressed_buttons.remove(button);
+                }
                 if let Some(b) = self
                     .pointer
                     .as_ref()
@@ -161,6 +220,11 @@ impl Devices {
                 }
             }
             EisCommand::Key { keycode, press } => {
+                if *press {
+                    self.pressed_keys.insert(*keycode);
+                } else {
+                    self.pressed_keys.remove(keycode);
+                }
                 if let Some(k) = self
                     .keyboard
                     .as_ref()
