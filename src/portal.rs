@@ -58,7 +58,7 @@ impl From<niri::Zone> for ZoneTuple {
 }
 
 /// A barrier the client asked us to watch.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Barrier {
     pub id: u32,
     pub x1: i32,
@@ -75,6 +75,55 @@ impl Barrier {
     pub fn is_horizontal(&self) -> bool {
         self.y1 == self.y2
     }
+}
+
+/// Specifications and ID mapping for barriers currently armed in Wayland.
+#[derive(Debug, Default)]
+struct ArmedState {
+    /// Specs currently armed: (session_handle, client_barrier).
+    specs: Vec<(OwnedObjectPath, Barrier)>,
+    /// Map from internal barrier ID on Wayland surfaces to (session_handle, client_barrier_id).
+    id_map: HashMap<u32, (OwnedObjectPath, u32)>,
+}
+
+/// Barrier specifications for all enabled sessions in deterministic order.
+fn compute_barrier_specs(
+    sessions: &HashMap<OwnedObjectPath, Session>,
+) -> Vec<(OwnedObjectPath, Barrier)> {
+    let mut handles: Vec<&OwnedObjectPath> = sessions.keys().collect();
+    handles.sort_by_key(|h| h.as_str());
+    handles
+        .into_iter()
+        .filter_map(|h| sessions.get(h).map(|s| (h, s)))
+        .filter(|(_, s)| s.enabled)
+        .flat_map(|(h, s)| s.barriers.iter().copied().map(move |b| (h.clone(), b)))
+        .collect()
+}
+
+/// Assign a unique internal barrier ID to each barrier spec across sessions.
+fn namespace_barriers<F>(
+    specs: &[(OwnedObjectPath, Barrier)],
+    mut alloc_id: F,
+) -> (Vec<Barrier>, HashMap<u32, (OwnedObjectPath, u32)>)
+where
+    F: FnMut() -> u32,
+{
+    let mut wayland_barriers = Vec::with_capacity(specs.len());
+    let mut id_map = HashMap::with_capacity(specs.len());
+
+    for (handle, b) in specs {
+        let internal_id = alloc_id();
+        id_map.insert(internal_id, (handle.clone(), b.id));
+        wayland_barriers.push(Barrier {
+            id: internal_id,
+            x1: b.x1,
+            y1: b.y1,
+            x2: b.x2,
+            y2: b.y2,
+        });
+    }
+
+    (wayland_barriers, id_map)
 }
 
 /// Size of the enabled outputs' bounding box in logical pixels.
@@ -105,9 +154,12 @@ fn region_of(zones: &[niri::OutputZone]) -> Option<eis_server::Region> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub handle: OwnedObjectPath,
+    /// Identifier of the client application that created this session (e.g. desktop entry
+    /// or Flatpak ID). Retained for debugging and tracing log attribution across portal operations.
+    #[allow(dead_code)]
     pub app_id: String,
     pub capabilities: u32,
     pub zone_set: u32,
@@ -207,6 +259,8 @@ pub struct State {
     /// Filled in once the bus connection exists, which is after the interface
     /// itself has to be constructed.
     conn: Arc<OnceLock<zbus::Connection>>,
+    armed: Arc<std::sync::Mutex<ArmedState>>,
+    next_internal_barrier_id: Arc<AtomicU32>,
 }
 
 impl State {
@@ -224,6 +278,8 @@ impl State {
             keymap,
             eis_closed,
             conn: Arc::new(OnceLock::new()),
+            armed: Arc::new(std::sync::Mutex::new(ArmedState::default())),
+            next_internal_barrier_id: Arc::new(AtomicU32::new(1)),
         };
         (state, closed_rx)
     }
@@ -269,22 +325,65 @@ impl State {
         self.clipboard.lock().await.owner_session.as_ref() == Some(handle)
     }
 
-    /// Find the enabled session that owns `barrier_id`.
-    async fn session_for_barrier(&self, barrier_id: u32) -> Option<OwnedObjectPath> {
-        let sessions = self.sessions.lock().await;
-        sessions
-            .values()
-            .find(|s| s.enabled && s.barriers.iter().any(|b| b.id == barrier_id))
-            .map(|s| s.handle.clone())
+    fn alloc_internal_barrier_id(&self) -> u32 {
+        loop {
+            let id = self.next_internal_barrier_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
     }
 
-    async fn session_handles(&self) -> Vec<OwnedObjectPath> {
-        self.sessions.lock().await.keys().cloned().collect()
+    fn clear_armed(&self) {
+        let mut armed = self.armed.lock().unwrap_or_else(|p| p.into_inner());
+        armed.specs.clear();
+        armed.id_map.clear();
+    }
+
+    /// Find the enabled session handle and client-chosen barrier ID for a Wayland-side barrier.
+    fn session_for_barrier(&self, internal_id: u32) -> Option<(OwnedObjectPath, u32)> {
+        let armed = self.armed.lock().unwrap_or_else(|p| p.into_inner());
+        armed.id_map.get(&internal_id).cloned()
+    }
+
+    /// Internal synchronization logic with deduplication and forced-path support.
+    fn sync_barriers_inner(&self, sessions: &HashMap<OwnedObjectPath, Session>, force: bool) {
+        let current_specs = compute_barrier_specs(sessions);
+
+        let mut armed = self.armed.lock().unwrap_or_else(|p| p.into_inner());
+        if !force && armed.specs == current_specs {
+            return;
+        }
+
+        if current_specs.is_empty() {
+            armed.specs.clear();
+            armed.id_map.clear();
+            self.wayland.send(WaylandCmd::Disarm);
+            return;
+        }
+
+        let (wayland_barriers, id_map) =
+            namespace_barriers(&current_specs, || self.alloc_internal_barrier_id());
+
+        armed.specs = current_specs;
+        armed.id_map = id_map;
+        self.wayland.send(WaylandCmd::Arm(wayland_barriers));
+    }
+
+    /// Call with the sessions lock held so send order matches state order.
+    fn sync_barriers(&self, sessions: &HashMap<OwnedObjectPath, Session>) {
+        self.sync_barriers_inner(sessions, false);
+    }
+
+    /// Forced barrier sync that bypasses the spec-deduplication check.
+    fn force_sync_barriers(&self, sessions: &HashMap<OwnedObjectPath, Session>) {
+        self.sync_barriers_inner(sessions, true);
     }
 
     /// Unlock the pointer and clear the screen edges. Used on shutdown so the
     /// session is never left with a grab owned by a process that is going away.
     pub fn release_everything(&self) {
+        self.clear_armed();
         self.wayland
             .send(WaylandCmd::EndCapture { cursor_hint: None });
         self.wayland.send(WaylandCmd::Disarm);
@@ -504,12 +603,23 @@ impl InputCapture {
 
         // A changed layout invalidates existing barriers, so the zone_set id has
         // to move with it — that is what tells the client its barriers are stale.
-        if session.zones.iter().map(|o| o.zone).ne(outputs.iter().map(|o| o.zone)) {
+        let should_sync = if session.zones.iter().map(|o| o.zone).ne(outputs.iter().map(|o| o.zone)) {
             session.zone_set = self.state.next_zone_set.fetch_add(1, Ordering::Relaxed);
+            let had_barriers = !session.barriers.is_empty();
             session.barriers.clear();
-        }
+            had_barriers && session.enabled
+        } else {
+            false
+        };
         session.zones = outputs;
 
+        if should_sync {
+            self.state.sync_barriers(&sessions);
+        }
+
+        let Some(session) = sessions.get(&session_handle) else {
+            return (RESPONSE_OTHER, Results::new());
+        };
         let tuples: Vec<ZoneTuple> = session.zones.iter().map(|o| o.zone.into()).collect();
         let zone_set = session.zone_set;
         debug!(%app_id, zone_set, "returning {} zone(s)", tuples.len());
@@ -568,11 +678,16 @@ impl InputCapture {
         if stale {
             warn!(%app_id, zone_set, current = session.zone_set, "rejecting barriers for stale zone_set");
         } else {
+            let enabled = session.enabled;
             session.barriers = accepted;
+            let count = session.barriers.len();
+            if enabled {
+                self.state.sync_barriers(&sessions);
+            }
             info!(
                 %app_id,
                 "accepted {} barrier(s), rejected {}",
-                session.barriers.len(),
+                count,
                 failed.len()
             );
         }
@@ -652,9 +767,7 @@ impl InputCapture {
         }
         session.enabled = true;
         info!(%app_id, barriers = session.barriers.len(), "capture enabled");
-        self.state
-            .wayland
-            .send(WaylandCmd::Arm(session.barriers.clone()));
+        self.state.sync_barriers(&sessions);
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -668,12 +781,16 @@ impl InputCapture {
         let Some(session) = sessions.get_mut(&session_handle) else {
             return (RESPONSE_OTHER, Results::new());
         };
+        let was_capturing = session.activation_id != 0;
         session.enabled = false;
         session.activation_id = 0;
+        if was_capturing {
+            self.state
+                .wayland
+                .send(WaylandCmd::EndCapture { cursor_hint: None });
+        }
         info!(%app_id, "capture disabled");
-        // Free the screen edges; leaving the surfaces up would keep swallowing
-        // clicks on the edge pixel column for no reason.
-        self.state.wayland.send(WaylandCmd::Disarm);
+        self.state.sync_barriers(&sessions);
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -698,16 +815,12 @@ impl InputCapture {
         session.activation_id = 0;
         info!(%app_id, ?cursor, "capture released");
 
-        // Unlock the pointer first, then rebuild the barriers so the pointer is
-        // back under local control before an edge can trigger again.
+        // End the capture on the Wayland side first, then ensure barriers reflect
+        // current session state.
         self.state
             .wayland
             .send(WaylandCmd::EndCapture { cursor_hint: cursor });
-        if session.enabled {
-            self.state
-                .wayland
-                .send(WaylandCmd::Arm(session.barriers.clone()));
-        }
+        self.state.sync_barriers(&sessions);
         (RESPONSE_SUCCESS, Results::new())
     }
 
@@ -941,6 +1054,7 @@ impl Control {
     /// trigger again until a client re-enables.
     async fn disarm(&self) -> String {
         let released = force_release_all(&self.state).await;
+        self.state.clear_armed();
         self.state.wayland.send(WaylandCmd::Disarm);
         format!(
             "released {} capture(s) and disarmed all barriers",
@@ -1034,14 +1148,14 @@ impl Control {
 
 /// End every in-flight capture, returning the sessions that were active.
 async fn force_release_all(state: &State) -> Vec<OwnedObjectPath> {
-    let active: Vec<OwnedObjectPath> = {
+    let active: Vec<(OwnedObjectPath, u32)> = {
         let mut sessions = state.sessions.lock().await;
-        let handles: Vec<OwnedObjectPath> = sessions
+        let active: Vec<(OwnedObjectPath, u32)> = sessions
             .values()
             .filter(|s| s.activation_id != 0)
-            .map(|s| s.handle.clone())
+            .map(|s| (s.handle.clone(), s.activation_id))
             .collect();
-        for handle in &handles {
+        for (handle, _) in &active {
             if let Some(session) = sessions.get_mut(handle) {
                 session.activation_id = 0;
                 if let Some(eis) = &session.eis {
@@ -1049,7 +1163,7 @@ async fn force_release_all(state: &State) -> Vec<OwnedObjectPath> {
                 }
             }
         }
-        handles
+        active
     };
 
     // Unlock first; the client being told afterwards is fine, the point is that
@@ -1057,35 +1171,53 @@ async fn force_release_all(state: &State) -> Vec<OwnedObjectPath> {
     state.wayland.send(WaylandCmd::EndCapture { cursor_hint: None });
 
     if let Some(conn) = state.connection() {
-        for handle in &active {
+        for (handle, id) in &active {
             let Ok(emitter) = SignalEmitter::new(conn, PORTAL_PATH) else {
                 continue;
             };
             let mut options: HashMap<String, Value<'_>> = HashMap::new();
-            options.insert("activation_id".into(), Value::from(0u32));
+            options.insert("activation_id".into(), Value::from(*id));
             let _ = InputCapture::deactivated(&emitter, handle.as_ref(), options).await;
         }
     }
 
-    if !active.is_empty() {
-        warn!("force-released {} capture(s)", active.len());
+    let handles: Vec<OwnedObjectPath> = active.into_iter().map(|(h, _)| h).collect();
+    if !handles.is_empty() {
+        warn!("force-released {} capture(s)", handles.len());
     }
-    active
+    handles
 }
 
 /// React to an EIS connection dying: a capture feeding a dead socket can never
-/// be ended by its client, so it has to be ended here.
+/// be ended by its client, so it has to be ended here, and barriers must be synced.
 pub async fn handle_eis_closed(state: State, mut closed: mpsc::UnboundedReceiver<String>) {
     while let Some(label) = closed.recv().await {
-        let was_capturing = {
-            let sessions = state.sessions.lock().await;
-            sessions
-                .values()
-                .any(|s| s.handle.as_str() == label && s.activation_id != 0)
-        };
-        if was_capturing {
-            warn!(session = %label, "EIS connection died mid-capture, releasing the pointer");
-            force_release_all(&state).await;
+        let mut was_capturing_handle = None;
+        {
+            let mut sessions = state.sessions.lock().await;
+            for s in sessions.values_mut() {
+                if s.handle.as_str() == label {
+                    if s.activation_id != 0 {
+                        was_capturing_handle = Some(s.handle.clone());
+                    }
+                    s.enabled = false;
+                }
+            }
+            if was_capturing_handle.is_some() {
+                state
+                    .wayland
+                    .send(WaylandCmd::EndCapture { cursor_hint: None });
+            }
+            state.sync_barriers(&sessions);
+        }
+
+        if let Some(handle) = was_capturing_handle {
+            warn!(session = %label, "EIS connection died mid-capture, released pointer");
+            if let Some(conn) = state.connection()
+                && let Err(err) = deactivate(&state, conn, &handle, (0.0, 0.0)).await
+            {
+                error!(session = %label, "failed to emit Deactivated on EIS close: {err}");
+            }
         }
     }
 }
@@ -1109,7 +1241,17 @@ impl SessionObject {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
         info!(session = %self.handle.as_str(), "session closed by portal");
-        self.state.sessions.lock().await.remove(&self.handle);
+        {
+            let mut sessions = self.state.sessions.lock().await;
+            if let Some(session) = sessions.remove(&self.handle) {
+                if session.activation_id != 0 {
+                    self.state
+                        .wayland
+                        .send(WaylandCmd::EndCapture { cursor_hint: None });
+                }
+            }
+            self.state.sync_barriers(&sessions);
+        }
         // A selection whose owner has gone is a clipboard that hangs every paste
         // on this machine, so the claim has to go with the session.
         if self.state.owns_clipboard(&self.handle).await {
@@ -1215,30 +1357,34 @@ pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiv
                 barrier_id,
                 position,
             } => {
-                let Some(handle) = state.session_for_barrier(barrier_id).await else {
-                    debug!(barrier_id, "no enabled session owns this barrier");
+                let Some((handle, client_barrier_id)) = state.session_for_barrier(barrier_id) else {
+                    warn!(barrier_id, "no enabled session owns this barrier; ending speculative capture and resyncing barriers");
+                    state.wayland.send(WaylandCmd::EndCapture { cursor_hint: None });
+                    let sessions = state.sessions.lock().await;
+                    state.force_sync_barriers(&sessions);
                     continue;
                 };
-                if let Err(err) = activate(&state, &conn, &handle, barrier_id, position).await {
-                    error!(barrier_id, "failed to emit Activated: {err}");
+                if let Err(err) = activate(&state, &conn, &handle, client_barrier_id, position).await {
+                    error!(client_barrier_id, "failed to emit Activated: {err}");
                 }
             }
             WaylandEvent::CaptureLost => {
                 // The grab is already gone; tell whichever session owned it so
                 // the client stops expecting events, and put the barriers back.
-                let active: Vec<(OwnedObjectPath, Vec<Barrier>)> = {
+                let active: Vec<OwnedObjectPath> = {
                     let sessions = state.sessions.lock().await;
-                    sessions
+                    let active = sessions
                         .values()
                         .filter(|s| s.activation_id != 0)
-                        .map(|s| (s.handle.clone(), s.barriers.clone()))
-                        .collect()
+                        .map(|s| s.handle.clone())
+                        .collect();
+                    state.sync_barriers(&sessions);
+                    active
                 };
-                for (handle, barriers) in active {
+                for handle in active {
                     if let Err(err) = deactivate(&state, &conn, &handle, (0.0, 0.0)).await {
                         error!("failed to emit Deactivated: {err}");
                     }
-                    state.wayland.send(WaylandCmd::Arm(barriers));
                 }
             }
             WaylandEvent::ClipboardSelection {
@@ -1285,9 +1431,14 @@ pub async fn pump_wayland_events(state: State, mut events: mpsc::UnboundedReceiv
                 announce_selection(&state, &conn, &mime_types, false).await;
             }
             WaylandEvent::OutputsChanged => {
+                let handles: Vec<OwnedObjectPath> = {
+                    let sessions = state.sessions.lock().await;
+                    state.force_sync_barriers(&sessions);
+                    sessions.keys().cloned().collect()
+                };
                 // Zones are stale for every session; the spec says clients must
                 // call GetZones again as soon as they see this.
-                for handle in state.session_handles().await {
+                for handle in handles {
                     let Ok(emitter) = SignalEmitter::new(&conn, PORTAL_PATH) else {
                         continue;
                     };
@@ -1383,6 +1534,159 @@ mod tests {
         let mut tracker = ClipboardTracker { next_serial: u32::MAX, ..Default::default() };
         let serial = tracker.begin_transfer(a_pipe());
         assert_ne!(serial, 0);
+    }
+
+    fn test_session(handle: &str, enabled: bool, barriers: Vec<Barrier>) -> Session {
+        Session {
+            handle: OwnedObjectPath::try_from(handle).unwrap(),
+            app_id: "test".into(),
+            capabilities: 0,
+            zone_set: 1,
+            zones: vec![],
+            barriers,
+            eis: None,
+            started: true,
+            enabled,
+            activation_id: 0,
+            clipboard_requested: false,
+        }
+    }
+
+    #[test]
+    fn zero_barrier_session_does_not_clear_another() {
+        let mut sessions = HashMap::new();
+        let handle1 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1").unwrap();
+        let handle2 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/2").unwrap();
+
+        sessions.insert(
+            handle1.clone(),
+            test_session(
+                "/org/freedesktop/portal/desktop/session/1",
+                true,
+                vec![Barrier { id: 10, x1: 0, y1: 0, x2: 0, y2: 1080 }],
+            ),
+        );
+        sessions.insert(
+            handle2.clone(),
+            test_session("/org/freedesktop/portal/desktop/session/2", true, vec![]),
+        );
+
+        let specs = compute_barrier_specs(&sessions);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, handle1);
+        assert_eq!(specs[0].1.id, 10);
+    }
+
+    #[test]
+    fn closing_session_keeps_remaining_barriers() {
+        let mut sessions = HashMap::new();
+        let handle1 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1").unwrap();
+        let handle2 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/2").unwrap();
+
+        sessions.insert(
+            handle1.clone(),
+            test_session(
+                "/org/freedesktop/portal/desktop/session/1",
+                true,
+                vec![Barrier { id: 1, x1: 0, y1: 0, x2: 0, y2: 1080 }],
+            ),
+        );
+        sessions.insert(
+            handle2.clone(),
+            test_session(
+                "/org/freedesktop/portal/desktop/session/2",
+                true,
+                vec![Barrier { id: 2, x1: 1920, y1: 0, x2: 1920, y2: 1080 }],
+            ),
+        );
+
+        assert_eq!(compute_barrier_specs(&sessions).len(), 2);
+
+        // Close session 2
+        sessions.remove(&handle2);
+
+        let specs = compute_barrier_specs(&sessions);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, handle1);
+        assert_eq!(specs[0].1.id, 1);
+    }
+
+    #[test]
+    fn disabled_session_is_excluded() {
+        let mut sessions = HashMap::new();
+        let handle1 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1").unwrap();
+        let handle2 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/2").unwrap();
+
+        sessions.insert(
+            handle1.clone(),
+            test_session(
+                "/org/freedesktop/portal/desktop/session/1",
+                true,
+                vec![Barrier { id: 1, x1: 0, y1: 0, x2: 0, y2: 1080 }],
+            ),
+        );
+        sessions.insert(
+            handle2.clone(),
+            test_session(
+                "/org/freedesktop/portal/desktop/session/2",
+                false,
+                vec![Barrier { id: 2, x1: 1920, y1: 0, x2: 1920, y2: 1080 }],
+            ),
+        );
+
+        let specs = compute_barrier_specs(&sessions);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, handle1);
+        assert_eq!(specs[0].1.id, 1);
+    }
+
+    #[test]
+    fn deterministic_ordering_across_hashmap_order() {
+        let mut s1 = HashMap::new();
+        let mut s2 = HashMap::new();
+        let h_a = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/a").unwrap();
+        let h_b = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/b").unwrap();
+
+        let sess_a = test_session(
+            "/org/freedesktop/portal/desktop/session/a",
+            true,
+            vec![Barrier { id: 1, x1: 0, y1: 0, x2: 0, y2: 100 }],
+        );
+        let sess_b = test_session(
+            "/org/freedesktop/portal/desktop/session/b",
+            true,
+            vec![Barrier { id: 2, x1: 100, y1: 0, x2: 100, y2: 100 }],
+        );
+
+        s1.insert(h_a.clone(), sess_a.clone());
+        s1.insert(h_b.clone(), sess_b.clone());
+
+        s2.insert(h_b, sess_b);
+        s2.insert(h_a, sess_a);
+
+        assert_eq!(compute_barrier_specs(&s1), compute_barrier_specs(&s2));
+    }
+
+    #[test]
+    fn barrier_id_namespacing_maps_back_to_client_id() {
+        let h1 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/1").unwrap();
+        let h2 = OwnedObjectPath::try_from("/org/freedesktop/portal/desktop/session/2").unwrap();
+
+        let specs = vec![
+            (h1.clone(), Barrier { id: 1, x1: 0, y1: 0, x2: 0, y2: 100 }),
+            (h2.clone(), Barrier { id: 1, x1: 100, y1: 0, x2: 100, y2: 100 }),
+        ];
+
+        let mut next_id = 1u32;
+        let (wayland_barriers, id_map) = namespace_barriers(&specs, || {
+            let id = next_id;
+            next_id += 1;
+            id
+        });
+
+        assert_ne!(wayland_barriers[0].id, wayland_barriers[1].id);
+        assert_eq!(id_map.get(&wayland_barriers[0].id), Some(&(h1, 1)));
+        assert_eq!(id_map.get(&wayland_barriers[1].id), Some(&(h2, 1)));
     }
 }
 
